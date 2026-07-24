@@ -1,0 +1,11 @@
+name = "reyhoon-gallery"
+main = "reyhoon-gallery-worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "SHOP_DB"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# این دو تا رو از داشبورد Cloudflare → Settings → Variables and Secrets ست کن:
+#   BOT_TOKEN
+#   ADMIN_ID
