@@ -6,28 +6,15 @@
   const PAGE_MODE = window.PAGE_MODE || "full"; // "featured" روی index، "full" روی shop
 
   // ---------- Data ----------
-  const DEFAULT_PRODUCTS = [
-    { id:1, name:"گردنبند زنجیر ظریف", category:"گردنبند", karat:18, weight:4.2, makingFee:18, art:"necklace", rating:4.8, badge:"پرفروش", featured:true },
-    { id:2, name:"دستبند زنجیری کلاسیک", category:"دستبند", karat:18, weight:6.8, makingFee:15, art:"bracelet", rating:4.6, badge:null, featured:false },
-    { id:3, name:"انگشتر سولیتر", category:"انگشتر", karat:18, weight:2.1, makingFee:28, art:"ring", rating:4.9, badge:"جدید", featured:true },
-    { id:4, name:"گوشواره مدالیونی", category:"گوشواره", karat:18, weight:1.8, makingFee:22, art:"earring", rating:4.7, badge:null, featured:false },
-    { id:5, name:"گردنبند طرح برگ", category:"گردنبند", karat:18, weight:5.5, makingFee:20, art:"necklace", rating:4.5, badge:null, featured:false },
-    { id:6, name:"دستبند پاندولی", category:"دستبند", karat:18, weight:3.4, makingFee:25, art:"bracelet", rating:4.8, badge:"پرفروش", featured:true },
-    { id:7, name:"شمش طلای ۲۴ عیار ۵ گرمی", category:"شمش", karat:24, weight:5, makingFee:3, art:"bar", rating:4.9, badge:"سرمایه‌گذاری", featured:true },
-    { id:8, name:"شمش طلای ۲۴ عیار ۱۰ گرمی", category:"شمش", karat:24, weight:10, makingFee:2, art:"bar", rating:4.9, badge:null, featured:false },
-    { id:9, name:"گردنبند ساده ۲۴ عیار", category:"گردنبند", karat:24, weight:6, makingFee:6, art:"necklace", rating:4.6, badge:null, featured:false },
-    { id:10, name:"النگوی ۲۴ عیار", category:"دستبند", karat:24, weight:8, makingFee:5, art:"bracelet", rating:4.7, badge:"جدید", featured:false },
-    { id:11, name:"دستبند کارکرده طرح ظریف", category:"دستبند", karat:"used", weight:5.5, makingFee:6, art:"bracelet", rating:4.3, badge:"کارکرده", featured:false },
-    { id:12, name:"گردنبند کارکرده سنتی", category:"گردنبند", karat:"used", weight:7.2, makingFee:5, art:"necklace", rating:4.2, badge:"کارکرده", featured:false },
-    { id:13, name:"انگشتر کارکرده", category:"انگشتر", karat:"used", weight:3.1, makingFee:8, art:"ring", rating:4.1, badge:"کارکرده", featured:false },
-    { id:14, name:"گوشواره کارکرده", category:"گوشواره", karat:"used", weight:2.5, makingFee:5, art:"earring", rating:4.0, badge:"کارکرده", featured:false },
-  ];
-
-  let PRODUCTS = DEFAULT_PRODUCTS.slice();
+  // محصولات فقط از گالری تلگرام (Cloudflare Worker) میان؛ دیتای نمایشی حذف شده.
+  let PRODUCTS = [];
   let galleryLoaded = false;
+  let galleryFailed = false;
 
   // آدرس Worker گالری تلگرام رو اینجا بذار
   const GALLERY_API_URL = "https://reyhoongoldgallery.tempmail41245.workers.dev";
+  // سفارش‌ها هم الان توی همین وورکر گالری هندل می‌شه (وورکر جدای orders دیگه لازم نیست)
+  const ORDERS_API_URL = GALLERY_API_URL;
 
   async function fetchGallery(){
     if(!GALLERY_API_URL) return;
@@ -35,16 +22,16 @@
       const res = await fetch(`${GALLERY_API_URL}/api/gallery`, { cache:"no-store" });
       if(!res.ok) throw new Error("bad status " + res.status);
       const data = await res.json();
-      if(Array.isArray(data.items) && data.items.length > 0){
+      if(Array.isArray(data.items)){
         PRODUCTS = data.items;
         galleryLoaded = true;
-        renderProducts();
-      } else if(Array.isArray(data.items)){
-        galleryLoaded = true;
+        galleryFailed = false;
         renderProducts();
       }
     } catch(err){
-      console.warn("اتصال به گالری تلگرام ناموفق بود، محصولات نمایشی نشون داده می‌شه:", err.message);
+      console.warn("اتصال به گالری تلگرام ناموفق بود:", err.message);
+      galleryFailed = true;
+      renderProducts();
     }
   }
 
@@ -66,6 +53,9 @@
   let lastRemoved = null; // { line, index }
 
   const toToman = n => Math.round(n).toLocaleString("fa-IR");
+  let priceReady = false;
+  let previousLivePrice = null;
+  const priceText = n => priceReady ? toToman(n) : "...";
   const price24kVal = () => usingLiveData && live24k ? live24k : pricePerGram*1.33;
   const priceEmamiVal = () => usingLiveData && liveEmami ? liveEmami : pricePerGram*8.13;
 
@@ -86,14 +76,18 @@
       if(item18k && item18k.price){
         const newPrice = Number(item18k.price);
         if(!isNaN(newPrice) && newPrice > 0){
+          const delta = previousLivePrice !== null ? newPrice - previousLivePrice : null;
+          previousLivePrice = newPrice;
           pricePerGram = newPrice;
           live24k = item24k ? Number(item24k.price) : null;
           liveEmami = itemEmami ? Number(itemEmami.price) : null;
           history.shift();
           history.push(pricePerGram);
           usingLiveData = true;
+          priceReady = true;
           updateLiveIndicator();
           refreshAllUI();
+          updatePriceChangeBadge(delta);
           return;
         }
       }
@@ -112,16 +106,34 @@
     const label = document.getElementById("liveLabel");
     if(!dot || !label) return;
     dot.classList.toggle("stale", !usingLiveData);
-    label.textContent = usingLiveData ? "قیمت زنده" : "حالت نمایشی";
+    label.textContent = usingLiveData ? "قیمت زنده" : "در حال دریافت قیمت...";
+  }
+
+  function updatePriceChangeBadge(delta){
+    const changeEl = document.getElementById("priceChange");
+    const changeVal = document.getElementById("changeVal");
+    if(!changeEl || !changeVal) return;
+    if(delta === null){
+      changeEl.style.display = "none";
+      return;
+    }
+    const positive = delta >= 0;
+    changeEl.style.display = "";
+    changeEl.className = "price-change num " + (positive ? "up" : "down");
+    changeVal.textContent = (positive ? "+" : "") + toToman(delta);
+  }
+
+  function renderMainPrices(){
+    const mp = document.getElementById("mainPrice");
+    if(mp) mp.textContent = priceText(pricePerGram);
+    const p24 = document.getElementById("price24");
+    if(p24) p24.textContent = priceText(price24kVal());
+    const pc = document.getElementById("priceCoin");
+    if(pc) pc.textContent = priceText(priceEmamiVal());
   }
 
   function refreshAllUI(){
-    const mp = document.getElementById("mainPrice");
-    if(mp) mp.textContent = toToman(pricePerGram);
-    const p24 = document.getElementById("price24");
-    if(p24) p24.textContent = toToman(price24kVal());
-    const pc = document.getElementById("priceCoin");
-    if(pc) pc.textContent = toToman(priceEmamiVal());
+    renderMainPrices();
     renderSparkline();
     renderTicker();
     renderProducts();
@@ -147,7 +159,6 @@
   function karatBaseRate(karat){ return karat === 24 ? price24kVal() : pricePerGram; }
   function karatLabel(karat){
     if(karat === 24) return "۲۴ عیار";
-    if(karat === "used") return "کارکرده";
     return "۱۸ عیار";
   }
   function productPrice(p){ return karatBaseRate(p.karat) * p.weight * (1 + p.makingFee/100); }
@@ -163,7 +174,7 @@
       { label:"نیم سکه", val:pricePerGram*4.06 },
       { label:"ربع سکه", val:pricePerGram*2.03 },
     ];
-    let groupHTML = items.map(it => `<span class="ticker-item"><span>${it.label}</span><span class="val num">${toToman(it.val)}</span><span class="unit">تومان</span></span>`).join("");
+    let groupHTML = items.map(it => `<span class="ticker-item"><span>${it.label}</span><span class="val num">${priceText(it.val)}</span><span class="unit">تومان</span></span>`).join("");
     track.innerHTML = `<div class="ticker-group">${groupHTML}</div><div class="ticker-group">${groupHTML}</div>`;
   }
 
@@ -171,6 +182,7 @@
   function renderSparkline(){
     const svg = document.getElementById("sparkline");
     if(!svg) return;
+    if(!priceReady){ svg.innerHTML = ""; return; }
     const w = 300, h = 36;
     const min = Math.min(...history), max = Math.max(...history);
     const range = (max - min) || 1;
@@ -182,36 +194,6 @@
     const positive = (history[history.length-1] >= history[history.length-2]);
     const color = positive ? "#7A8471" : "#8B2E2E";
     svg.innerHTML = `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`;
-  }
-
-  // ---------- Simulated price update (demo fallback) ----------
-  function updatePrice(){
-    if(usingLiveData) return;
-    const delta = (Math.random() - 0.48) * 35000;
-    pricePerGram = Math.max(37000000, pricePerGram + delta);
-    history.shift();
-    history.push(pricePerGram);
-
-    const mp = document.getElementById("mainPrice");
-    if(mp) mp.textContent = toToman(pricePerGram);
-    const p24 = document.getElementById("price24");
-    if(p24) p24.textContent = toToman(pricePerGram*1.33);
-    const pc = document.getElementById("priceCoin");
-    if(pc) pc.textContent = toToman(pricePerGram*8.13);
-
-    const changeEl = document.getElementById("priceChange");
-    if(changeEl){
-      const changeVal = document.getElementById("changeVal");
-      const positive = delta >= 0;
-      changeEl.className = "price-change num " + (positive ? "up" : "down");
-      changeVal.textContent = (positive ? "+" : "") + toToman(delta);
-    }
-
-    renderSparkline();
-    renderTicker();
-    renderProducts();
-    updateCalculator();
-    renderCart();
   }
 
   // ---------- Products ----------
@@ -242,12 +224,21 @@
     const list = visibleProducts();
 
     if(list.length === 0){
-      const msg = PAGE_MODE === "featured"
-        ? "هنوز محصول ویژه‌ای برای صفحه اصلی انتخاب نشده."
-        : "محصولی با این فیلترها پیدا نشد.";
+      let msg, sub = "";
+      if(!galleryLoaded && !galleryFailed){
+        msg = "در حال بارگذاری محصولات...";
+      } else if(galleryFailed){
+        msg = "در حال حاضر امکان بارگذاری محصولات نیست.";
+        sub = "لطفاً چند لحظه دیگه دوباره سر بزن.";
+      } else if(PAGE_MODE === "featured"){
+        msg = "هنوز محصول ویژه‌ای برای صفحه اصلی انتخاب نشده.";
+      } else {
+        msg = "محصولی با این فیلترها پیدا نشد.";
+        sub = "فیلترها رو تغییر بده یا بعداً دوباره سر بزن.";
+      }
       grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">
         <div class="t">${msg}</div>
-        ${PAGE_MODE === "full" ? '<div>فیلترها رو تغییر بده یا بعداً دوباره سر بزن.</div>' : ''}
+        ${sub ? `<div>${sub}</div>` : ''}
       </div>`;
       return;
     }
@@ -270,7 +261,7 @@
               <span class="dot">· ${p.weight} گرم</span>
               <span class="dot">· ${karatLabel(p.karat)}</span>
             </div>
-            <div class="product-price num">${toToman(productPrice(p))} تومان</div>
+            <div class="product-price num">${priceText(productPrice(p))} تومان</div>
             <button class="add-btn" data-add="${p.id}">افزودن به سبد</button>
           </div>
         </div>`;
@@ -334,7 +325,7 @@
     document.getElementById("lightboxName").textContent = p.name;
     document.getElementById("lightboxMeta").innerHTML =
       `<span class="star">★</span><span class="num">${p.rating}</span><span class="dot">· ${p.weight} گرم</span><span class="dot">· ${karatLabel(p.karat)}</span>`;
-    document.getElementById("lightboxPrice").textContent = toToman(productPrice(p)) + " تومان";
+    document.getElementById("lightboxPrice").textContent = priceText(productPrice(p)) + " تومان";
     document.getElementById("lightboxAdd").onclick = () => addToCart(p.id);
   }
 
@@ -395,9 +386,9 @@
     const total = rate * calcWeight * (1 + calcFee/100);
     const base = rate * calcWeight;
     const fee = base * (calcFee/100);
-    totalEl.textContent = toToman(total);
-    document.getElementById("calcBase").textContent = toToman(base) + " تومان";
-    document.getElementById("calcFee").textContent = toToman(fee) + " تومان";
+    totalEl.textContent = priceText(total);
+    document.getElementById("calcBase").textContent = priceText(base) + " تومان";
+    document.getElementById("calcFee").textContent = priceText(fee) + " تومان";
   }
 
   const calcKaratBtns = document.getElementById("calcKaratBtns");
@@ -486,22 +477,29 @@
     empty.style.display = "none";
     footer.style.display = "block";
 
-    list.innerHTML = (undoWrap ? undoWrap.outerHTML : "") + cart.map((l, i) => `
+    list.innerHTML = (undoWrap ? undoWrap.outerHTML : "") + cart.map((l, i) => {
+      const base = karatBaseRate(l.product.karat) * l.product.weight;
+      const fee = base * (l.product.makingFee/100);
+      return `
       <div class="cart-item" data-idx="${i}">
         <div class="thumb">${productVisual(l.product)}</div>
         <div class="info">
           <div class="n">${l.product.name}</div>
-          <div class="p num">${toToman(productPrice(l.product))} تومان</div>
+          <div class="meta">${karatLabel(l.product.karat)} · ${l.product.weight} گرم</div>
+          <div class="meta">طلا: ${toToman(base)} + اجرت: ${toToman(fee)}</div>
+          <div class="p num">${toToman(productPrice(l.product))} تومان <span class="unit">/ عدد</span></div>
           <div class="qty-stepper">
             <button data-qty-minus="${i}" aria-label="کم کردن تعداد">−</button>
             <span class="q num">${l.qty}</span>
             <button data-qty-plus="${i}" aria-label="زیاد کردن تعداد">+</button>
           </div>
+          <div class="line-total num">جمع: ${toToman(productPrice(l.product) * l.qty)} تومان</div>
         </div>
         <button class="remove" data-remove="${i}" aria-label="حذف">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
-      </div>`).join("");
+      </div>`;
+    }).join("");
 
     list.querySelectorAll("[data-remove]").forEach(btn => {
       btn.addEventListener("click", () => removeFromCart(parseInt(btn.getAttribute("data-remove"))));
@@ -598,7 +596,7 @@
 
   const checkoutSubmit = document.getElementById("checkoutSubmit");
   if(checkoutSubmit){
-    checkoutSubmit.addEventListener("click", () => {
+    checkoutSubmit.addEventListener("click", async () => {
       const name = document.getElementById("ckName").value.trim();
       const phone = document.getElementById("ckPhone").value.trim();
       const address = document.getElementById("ckAddress").value.trim();
@@ -608,7 +606,15 @@
       const addressOk = validateField("fieldAddress", address.length >= 5);
       if(!nameOk || !phoneOk || !addressOk) return;
 
-      const lines = cart.map(l => `- ${l.product.name} × ${l.qty} — ${toToman(productPrice(l.product)*l.qty)} تومان`).join("\n");
+      const orderItems = cart.map(l => ({
+        name: l.product.name,
+        karat: l.product.karat,
+        weight: l.product.weight,
+        qty: l.qty,
+        unitPrice: productPrice(l.product),
+      }));
+
+      const lines = cart.map(l => `- ${l.product.name} (${karatLabel(l.product.karat)}، ${l.product.weight} گرم) × ${l.qty} — ${toToman(productPrice(l.product)*l.qty)} تومان`).join("\n");
       const message =
 `سفارش جدید از ریحون گلد گالری
 نام: ${name}
@@ -622,6 +628,44 @@ ${lines}
 
       const tgLink = `https://t.me/${SHOP_TELEGRAM_USERNAME}?text=${encodeURIComponent(message)}`;
       document.getElementById("checkoutTelegramLink").href = tgLink;
+
+      checkoutSubmit.disabled = true;
+      checkoutSubmit.textContent = "در حال ثبت سفارش...";
+
+      let ticketNumber = null;
+      if(ORDERS_API_URL){
+        try{
+          const res = await fetch(`${ORDERS_API_URL}/api/order`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, phone, address, items: orderItems, total: cartTotal() }),
+          });
+          if(res.ok){
+            const data = await res.json();
+            if(data.ok && data.ticketNumber) ticketNumber = data.ticketNumber;
+          }
+        } catch(err){
+          console.warn("ارسال خودکار تیکت ناموفق بود:", err.message);
+        }
+      }
+
+      checkoutSubmit.disabled = false;
+      checkoutSubmit.textContent = "ثبت سفارش و ارسال به تلگرام";
+
+      const ticketDisplay = document.getElementById("ticketNumberDisplay");
+      const tgLinkEl = document.getElementById("checkoutTelegramLink");
+      const successDesc = document.getElementById("checkoutSuccessDesc");
+
+      if(ticketNumber){
+        ticketDisplay.style.display = "block";
+        ticketDisplay.textContent = "شماره پیگیری تیکت: #" + ticketNumber;
+        tgLinkEl.style.display = "none";
+        successDesc.textContent = "تیکت سفارش شما مستقیم برای ما ارسال شد. برای پیگیری همین شماره تیکت رو نگه دارید.";
+      } else {
+        ticketDisplay.style.display = "none";
+        tgLinkEl.style.display = "block";
+        successDesc.textContent = "برای تکمیل سفارش، روی دکمه زیر بزنید تا خلاصه سفارش به تلگرام ما ارسال بشه.";
+      }
 
       stepForm.style.display = "none";
       stepSuccess.style.display = "block";
@@ -650,6 +694,8 @@ ${lines}
   // ---------- Init ----------
   renderSkeleton();
   loadCart();
+  updatePriceChangeBadge(null);
+  renderMainPrices();
   renderTicker();
   renderSparkline();
   renderProducts();
@@ -658,7 +704,6 @@ ${lines}
   updateLiveIndicator();
   fetchLivePrice();
   fetchGallery();
-  setInterval(updatePrice, 3000);
   setInterval(fetchLivePrice, LIVE_REFRESH_MS);
   setInterval(fetchGallery, 30000);
 })();
