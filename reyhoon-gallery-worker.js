@@ -54,6 +54,12 @@ export default {
 
     return new Response("Reyhoon Gold Gallery API - OK", { status: 200 });
   },
+
+  // این بخش رو Cloudflare خودکار صدا می‌زنه، فقط باید توی Settings → Triggers
+  // یه Cron Trigger اضافه کنی (مثلاً هر روز ساعت ۰۰:۰۰ → 0 0 * * *)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runBackup(env, "خودکار (زمان‌بندی‌شده)"));
+  },
 };
 
 // ============================================================
@@ -127,6 +133,13 @@ async function handleNewOrder(request, env) {
 
   await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
 
+  // ---- کم کردن موجودی انبار بر اساس محصولات سفارش‌داده‌شده ----
+  try {
+    await decreaseStockForOrder(items, env);
+  } catch (err) {
+    // اگه کم کردن موجودی خطا بده، سفارش همچنان ثبت می‌مونه
+  }
+
   const itemLines = items.map(function (it) {
     const karatText = it.karat + " عیار";
     return "- " + it.name + " (" + karatText + "، " + it.weight + " گرم) x" + it.qty + " = " + toToman(it.unitPrice * it.qty) + " تومان";
@@ -141,12 +154,46 @@ async function handleNewOrder(request, env) {
     "جمع کل: " + toToman(total) + " تومان";
 
   try {
-    await sendMessage(env.ADMIN_ID, message, env);
+    await sendMessage(env.ADMIN_ID, message, env, [
+      [{ text: "✅ تایید سفارش", callback_data: "apporder:" + ticketNumber }, { text: "❌ رد سفارش", callback_data: "rejorder:" + ticketNumber }],
+    ]);
   } catch (err) {
     // حتی اگه ارسال به تلگرام خطا بده، تیکت ذخیره شده و شماره‌ش برمی‌گرده
   }
 
   return jsonResponse({ ok: true, ticketNumber: ticketNumber });
+}
+
+async function decreaseStockForOrder(orderedItems, env) {
+  const items = await getItems(env);
+  let changed = false;
+  for (const ordered of orderedItems) {
+    if (ordered.id == null) continue;
+    const match = items.find((it) => it.id === ordered.id);
+    if (!match) continue;
+    if (typeof match.stock === "number") {
+      const qty = Number(ordered.qty) || 0;
+      match.stock = Math.max(0, match.stock - qty);
+      changed = true;
+    }
+  }
+  if (changed) await saveItems(items, env);
+}
+
+async function increaseStockForOrder(orderedItems, env) {
+  const items = await getItems(env);
+  let changed = false;
+  for (const ordered of orderedItems) {
+    if (ordered.id == null) continue;
+    const match = items.find((it) => it.id === ordered.id);
+    if (!match) continue;
+    if (typeof match.stock === "number") {
+      const qty = Number(ordered.qty) || 0;
+      match.stock = match.stock + qty;
+      changed = true;
+    }
+  }
+  if (changed) await saveItems(items, env);
 }
 
 function toToman(n) {
@@ -160,9 +207,101 @@ async function getNextTicket(env) {
   return next;
 }
 
+async function handleOrderDecision(data, chatId, messageId, env) {
+  const parts = data.split(":");
+  const approve = parts[0] === "apporder";
+  const ticketNumber = parseInt(parts[1]);
+
+  const raw = await env.SHOP_DB.get("order:" + ticketNumber);
+  if (!raw) {
+    await editMessage(chatId, messageId, "این تیکت پیدا نشد (شاید قبلاً حذف شده).", env);
+    return;
+  }
+  const order = JSON.parse(raw);
+
+  if (order.status !== "pending") {
+    await editMessage(chatId, messageId,
+      "این سفارش قبلاً " + (order.status === "approved" ? "تایید" : "رد") + " شده.", env);
+    return;
+  }
+
+  if (approve) {
+    order.status = "approved";
+    await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
+    await editMessage(chatId, messageId,
+      "✅ سفارش #" + ticketNumber + " تایید شد.\nموجودی انبار همون‌طوری که کم شده بود می‌مونه.", env);
+  } else {
+    order.status = "rejected";
+    await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
+    try {
+      await increaseStockForOrder(order.items, env);
+    } catch (err) {
+      // اگه برگردوندن موجودی خطا بده، وضعیت سفارش همچنان rejected ثبت می‌مونه
+    }
+    await editMessage(chatId, messageId,
+      "❌ سفارش #" + ticketNumber + " رد شد.\nموجودی اقلامش به انبار برگشت.", env);
+  }
+}
+
+
 // ============================================================
-//  Debug
+//  پشتیبان‌گیری (Backup)
 // ============================================================
+async function buildBackupPayload(env) {
+  const items = await getItems(env);
+  const settings = await getSettings(env);
+
+  const orderKeys = await env.SHOP_DB.list({ prefix: "order:" });
+  const orders = [];
+  for (const key of orderKeys.keys) {
+    const raw = await env.SHOP_DB.get(key.name);
+    if (raw) orders.push(JSON.parse(raw));
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    items: items,
+    settings: settings,
+    orders: orders,
+  };
+}
+
+async function runBackup(env, sourceLabel) {
+  const payload = await buildBackupPayload(env);
+  const json = JSON.stringify(payload, null, 2);
+  const dateKey = payload.generatedAt.slice(0, 10); // YYYY-MM-DD
+
+  // یه نسخه با تاریخ، و یه نسخه‌ی "آخرین بک‌آپ" همیشه توی KV می‌مونه
+  await env.SHOP_DB.put("backup:" + dateKey, json);
+  await env.SHOP_DB.put("backup:latest", json);
+
+  const filename = "reyhoon-backup-" + dateKey + ".json";
+  try {
+    await sendDocument(env.ADMIN_ID, json, filename,
+      "بک‌آپ " + (sourceLabel || "دستی") + " — " + payload.items.length + " محصول، " + payload.orders.length + " سفارش", env);
+  } catch (err) {
+    // حتی اگه ارسال فایل به تلگرام خطا بده، نسخه‌ی KV ذخیره شده
+  }
+
+  return payload;
+}
+
+async function sendDocument(chatId, content, filename, caption, env) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption);
+  form.append("document", new Blob([content], { type: "application/json" }), filename);
+  const res = await fetch("https://api.telegram.org/bot" + env.BOT_TOKEN + "/sendDocument", {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.log("sendDocument failed:", res.status, errText);
+  }
+  return res;
+}
+
 async function handleDebugSend(env) {
   const res = await tgApi("sendMessage", { chat_id: env.ADMIN_ID, text: "test from debug endpoint" }, env);
   const text = await res.text();
@@ -280,6 +419,12 @@ async function handleAdminMessage(msg, chatId, env) {
     return;
   }
 
+  if (msg.text === "/backup") {
+    await sendMessage(chatId, "در حال تهیه بک‌آپ...", env);
+    await runBackup(env, "دستی");
+    return;
+  }
+
   await sendMessage(chatId, "برای شروع از /start استفاده کن.", env);
 }
 
@@ -305,7 +450,16 @@ async function handlePendingState(state, msg, chatId, env) {
   if (state === "new_name") {
     await saveDraft(chatId, { name: msg.text }, env);
     await env.SHOP_DB.put("state:" + chatId, "new_category");
-    await sendMessage(chatId, "مرحله ۲ از ۶ — دسته محصول رو انتخاب کن:", env, categoryKeyboard());
+    await sendMessage(chatId, "مرحله ۲ از ۹ — دسته محصول رو انتخاب کن:", env, categoryKeyboard());
+    return true;
+  }
+
+  if (state === "new_model") {
+    const raw = msg.text.trim();
+    const noneVal = /^(ندارد|نداره|no|none|-|خیر)$/i.test(raw);
+    await saveDraft(chatId, { model: noneVal ? null : raw }, env);
+    await env.SHOP_DB.put("state:" + chatId, "new_karat");
+    await sendMessage(chatId, "مرحله ۴ از ۹ — عیار رو انتخاب کن:", env, karatKeyboard());
     return true;
   }
 
@@ -315,15 +469,27 @@ async function handlePendingState(state, msg, chatId, env) {
       await sendMessage(chatId, "عدد نامعتبره. وزن رو به گرم بفرست (مثلاً 4.2):", env, cancelKeyboard());
       return true;
     }
-    const draft = await saveDraft(chatId, { weight: val }, env);
-    // اگه از مسیر "مشابه آخرین" اومده باشیم، بقیه فیلدها از قبل ست شدن → مستقیم برو مرحله عکس
-    if (draft.karat !== undefined && draft.fee !== undefined) {
+    await saveDraft(chatId, { weight: val }, env);
+    await env.SHOP_DB.put("state:" + chatId, "new_stock");
+    await sendMessage(chatId, "مرحله ۶ از ۹ — چند عدد از این محصول موجوده؟ (عدد صحیح، مثلاً 3):", env, cancelKeyboard());
+    return true;
+  }
+
+  if (state === "new_stock") {
+    const val = parseInt(msg.text, 10);
+    if (isNaN(val) || val < 0) {
+      await sendMessage(chatId, "عدد نامعتبره. تعداد موجودی رو به‌صورت عدد صحیح بفرست (مثلاً 3):", env, cancelKeyboard());
+      return true;
+    }
+    const draft = await saveDraft(chatId, { stock: val }, env);
+    // اگه از مسیر "مشابه آخرین" اومده باشیم، بقیه فیلدها (اجرت/برچسب/ویژه) از قبل ست شدن → مستقیم برو مرحله عکس
+    if (draft.fee !== undefined) {
       await env.SHOP_DB.put("state:" + chatId, "new_photo");
       await sendMessage(chatId, "آخرین مرحله — حالا عکس محصول رو بفرست 📷", env, cancelKeyboard());
       return true;
     }
     await env.SHOP_DB.put("state:" + chatId, "new_fee_choice");
-    await sendMessage(chatId, "مرحله ۴ از ۶ — برای اجرت چیکار کنیم؟", env, [
+    await sendMessage(chatId, "مرحله ۷ از ۹ — برای اجرت چیکار کنیم؟", env, [
       [{ text: "استفاده از اجرت پیش‌فرض", callback_data: "newfee:default" }],
       [{ text: "وارد کردن دستی", callback_data: "newfee:manual" }],
       [{ text: "انصراف", callback_data: "newitem_cancel" }],
@@ -339,8 +505,12 @@ async function handlePendingState(state, msg, chatId, env) {
     }
     await saveDraft(chatId, { fee: val }, env);
     await env.SHOP_DB.put("state:" + chatId, "new_badge");
-    await sendMessage(chatId, "مرحله ۵ از ۶ — برچسب محصول رو انتخاب کن:", env, badgeKeyboard());
+    await sendMessage(chatId, "مرحله ۸ از ۹ — برچسب محصول رو انتخاب کن:", env, badgeKeyboard());
     return true;
+  }
+
+  if (state.startsWith("editval:")) {
+    return await handleEditValueInput(state, msg, chatId, env);
   }
 
   if (state.startsWith("await_fee_")) {
@@ -396,7 +566,7 @@ async function getLastDraft(chatId, env) {
 
 async function saveLastDraft(chatId, draft, env) {
   // فقط ویژگی‌های قابل تکرار رو نگه می‌داریم، نه نام/وزن/عکس
-  const reusable = { category: draft.category, karat: draft.karat, fee: draft.fee, badge: draft.badge, featured: draft.featured };
+  const reusable = { category: draft.category, model: draft.model, karat: draft.karat, fee: draft.fee, badge: draft.badge, featured: draft.featured };
   await env.SHOP_DB.put("lastdraft:" + chatId, JSON.stringify(reusable));
 }
 
@@ -442,9 +612,10 @@ function draftSummaryText(draft) {
   return (
     "پیش‌نمایش محصول:\n\n" +
     "نام: " + draft.name + "\n" +
-    "دسته: " + draft.category + "\n" +
+    "دسته: " + draft.category + (draft.model ? " (" + draft.model + ")" : "") + "\n" +
     "عیار: " + karatTxt + "\n" +
     "وزن: " + draft.weight + " گرم\n" +
+    "موجودی: " + draft.stock + " عدد\n" +
     "اجرت: " + feeTxt + "\n" +
     "برچسب: " + (draft.badge || "—") + "\n" +
     "نمایش در صفحه اصلی: " + (draft.featured ? "بله ✅" : "خیر") + "\n\n" +
@@ -478,8 +649,10 @@ async function finalizeNewItem(chatId, env) {
     id: nextId,
     name: draft.name,
     category: draft.category,
+    model: draft.model || null,
     karat: karatVal,
     weight: draft.weight,
+    stock: typeof draft.stock === "number" ? draft.stock : 0,
     makingFee: draft.fee != null ? draft.fee : defaultFee,
     badge: draft.badge || null,
     featured: !!draft.featured,
@@ -515,6 +688,18 @@ async function handleCallbackQuery(cq, env) {
 
   await answerCallback(cq.id, env);
 
+  if (data.startsWith("apporder:") || data.startsWith("rejorder:")) {
+    await handleOrderDecision(data, chatId, messageId, env);
+    return;
+  }
+
+  if (data === "dobackup") {
+    await editMessage(chatId, messageId, "در حال تهیه بک‌آپ...", env);
+    await runBackup(env, "دستی");
+    await editMessage(chatId, messageId, "✅ بک‌آپ ساخته و برات به‌صورت فایل ارسال شد.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+
   if (data === "menu") {
     await editMessage(chatId, messageId, DASHBOARD_TEXT, env, dashboardKeyboard());
     return;
@@ -534,6 +719,90 @@ async function handleCallbackQuery(cq, env) {
     return;
   }
 
+  if (data.startsWith("editmenu:")) {
+    const page = parseInt(data.split(":")[1]) || 0;
+    await editItemListMessage(chatId, messageId, env, page, "edit");
+    return;
+  }
+
+  if (data.startsWith("edit:")) {
+    const id = parseInt(data.split(":")[1]);
+    await env.SHOP_DB.delete("state:" + chatId);
+    await showEditFieldMenu(chatId, messageId, env, id);
+    return;
+  }
+
+  if (data.startsWith("editf:")) {
+    const parts = data.split(":");
+    const id = parseInt(parts[1]);
+    const field = parts[2];
+
+    if (field === "category") {
+      await editMessage(chatId, messageId, "دسته جدید رو انتخاب کن:", env, editCategoryKeyboard(id));
+      return;
+    }
+    if (field === "karat") {
+      await editMessage(chatId, messageId, "عیار جدید رو انتخاب کن:", env, editKaratKeyboard(id));
+      return;
+    }
+    if (field === "badge") {
+      await editMessage(chatId, messageId, "برچسب جدید رو انتخاب کن:", env, editBadgeKeyboard(id));
+      return;
+    }
+    if (field === "featured") {
+      await editMessage(chatId, messageId, "نمایش در صفحه اصلی؟", env, editFeaturedKeyboard(id));
+      return;
+    }
+
+    const prompts = {
+      name: "نام جدید رو بفرست:",
+      model: "مدل/طرح جدید رو بفرست (برای حذف مدل بنویس «ندارد»):",
+      weight: "وزن جدید رو به گرم بفرست (مثلاً 4.2):",
+      fee: "درصد اجرت جدید رو بفرست (مثلاً 18):",
+      stock: "تعداد موجودی جدید رو بفرست (مثلاً 5):",
+    };
+    if (!prompts[field]) return;
+    await env.SHOP_DB.put("state:" + chatId, "editval:" + id + ":" + field);
+    await editMessage(chatId, messageId, prompts[field], env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
+    return;
+  }
+
+  if (data.startsWith("setcat:")) {
+    const parts = data.split(":");
+    const id = parseInt(parts[1]);
+    const value = parts.slice(2).join(":");
+    await updateItemField(env, id, "category", value);
+    await showEditFieldMenu(chatId, messageId, env, id);
+    return;
+  }
+
+  if (data.startsWith("setkarat:")) {
+    const parts = data.split(":");
+    const id = parseInt(parts[1]);
+    const value = parseInt(parts[2]);
+    await updateItemField(env, id, "karat", value);
+    await showEditFieldMenu(chatId, messageId, env, id);
+    return;
+  }
+
+  if (data.startsWith("setbadge:")) {
+    const parts = data.split(":");
+    const id = parseInt(parts[1]);
+    const value = parts[2] === "none" ? null : parts.slice(2).join(":");
+    await updateItemField(env, id, "badge", value);
+    await showEditFieldMenu(chatId, messageId, env, id);
+    return;
+  }
+
+  if (data.startsWith("setfeatured:")) {
+    const parts = data.split(":");
+    const id = parseInt(parts[1]);
+    const value = parts[2] === "yes";
+    await updateItemField(env, id, "featured", value);
+    await showEditFieldMenu(chatId, messageId, env, id);
+    return;
+  }
+
   if (data.startsWith("del:")) {
     const id = parseInt(data.split(":")[1]);
     const items = await getItems(env);
@@ -548,7 +817,7 @@ async function handleCallbackQuery(cq, env) {
   if (data === "newitem") {
     await clearDraft(chatId, env);
     await env.SHOP_DB.put("state:" + chatId, "new_name");
-    await editMessage(chatId, messageId, "بیا محصول جدید اضافه کنیم 🛍\n\nمرحله ۱ از ۶ — نام محصول رو بفرست:", env, cancelKeyboard());
+    await editMessage(chatId, messageId, "بیا محصول جدید اضافه کنیم 🛍\n\nمرحله ۱ از ۹ — نام محصول رو بفرست:", env, cancelKeyboard());
     return;
   }
 
@@ -581,9 +850,17 @@ async function handleCallbackQuery(cq, env) {
 
   if (data.startsWith("newcat:")) {
     const val = data.slice("newcat:".length);
-    await saveDraft(chatId, { category: val }, env);
-    await env.SHOP_DB.put("state:" + chatId, "new_karat");
-    await editMessage(chatId, messageId, "مرحله ۳ از ۶ — عیار رو انتخاب کن:", env, karatKeyboard());
+    const draft = await saveDraft(chatId, { category: val }, env);
+    // مسیر سریع «مشابه همین»: اگه مدل قبلاً از پیش‌نویس قبلی ست شده، دوباره نپرس
+    if (draft.model !== undefined) {
+      await env.SHOP_DB.put("state:" + chatId, "new_karat");
+      await editMessage(chatId, messageId, "مرحله ۴ از ۹ — عیار رو انتخاب کن:", env, karatKeyboard());
+      return;
+    }
+    await env.SHOP_DB.put("state:" + chatId, "new_model");
+    await editMessage(chatId, messageId,
+      "مرحله ۳ از ۹ — اگه این دسته مدل/طرح خاصی داره بنویس (مثلاً «مدل زنجیری» یا «طرح ظریف»)، وگرنه بنویس «ندارد»:",
+      env, cancelKeyboard());
     return;
   }
 
@@ -591,14 +868,14 @@ async function handleCallbackQuery(cq, env) {
     const val = data.slice("newkarat:".length);
     await saveDraft(chatId, { karat: val }, env);
     await env.SHOP_DB.put("state:" + chatId, "new_weight");
-    await editMessage(chatId, messageId, "مرحله ۳ از ۶ — وزن رو به گرم بفرست (مثلاً 4.2):", env, cancelKeyboard());
+    await editMessage(chatId, messageId, "مرحله ۵ از ۹ — وزن رو به گرم بفرست (مثلاً 4.2):", env, cancelKeyboard());
     return;
   }
 
   if (data === "newfee:default") {
     await saveDraft(chatId, { fee: null }, env);
     await env.SHOP_DB.put("state:" + chatId, "new_badge");
-    await editMessage(chatId, messageId, "مرحله ۵ از ۶ — برچسب محصول رو انتخاب کن:", env, badgeKeyboard());
+    await editMessage(chatId, messageId, "مرحله ۸ از ۹ — برچسب محصول رو انتخاب کن:", env, badgeKeyboard());
     return;
   }
 
@@ -614,7 +891,7 @@ async function handleCallbackQuery(cq, env) {
     // انتخاب هوشمند پیش‌فرض: اگه برچسب «پرفروش» بود پیشنهاد می‌دیم نمایش در اصلی هم فعال باشه
     await saveDraft(chatId, patch, env);
     await env.SHOP_DB.put("state:" + chatId, "new_featured");
-    await editMessage(chatId, messageId, "مرحله ۶ از ۶ — این محصول تو صفحه اصلی (بخش پرفروش‌ها) هم نمایش داده بشه؟", env, featuredKeyboard());
+    await editMessage(chatId, messageId, "مرحله ۹ از ۹ — این محصول تو صفحه اصلی (بخش پرفروش‌ها) هم نمایش داده بشه؟", env, featuredKeyboard());
     return;
   }
 
@@ -692,9 +969,10 @@ const DASHBOARD_TEXT = "پنل مدیریت گالری طلا 🏆\nیکی از 
 
 function dashboardKeyboard() {
   return [
-    [{ text: "📋 لیست محصولات", callback_data: "list:0" }, { text: "🗑 حذف محصول", callback_data: "delmenu:0" }],
-    [{ text: "📊 آمار فروشگاه", callback_data: "stats" }, { text: "⚙️ تنظیمات اجرت", callback_data: "settings" }],
-    [{ text: "➕ افزودن محصول جدید", callback_data: "newitem" }, { text: "🎫 تیکت‌های باز", callback_data: "tickets:0" }],
+    [{ text: "📋 لیست محصولات", callback_data: "list:0" }, { text: "✏️ ویرایش محصول", callback_data: "editmenu:0" }],
+    [{ text: "🗑 حذف محصول", callback_data: "delmenu:0" }, { text: "📊 آمار فروشگاه", callback_data: "stats" }],
+    [{ text: "⚙️ تنظیمات اجرت", callback_data: "settings" }, { text: "🎫 تیکت‌های باز", callback_data: "tickets:0" }],
+    [{ text: "➕ افزودن محصول جدید", callback_data: "newitem" }, { text: "💾 بک‌آپ فوری", callback_data: "dobackup" }],
     [{ text: "📖 روش سریع (عکس+کپشن)", callback_data: "addhelp" }],
   ];
 }
@@ -708,19 +986,25 @@ const HELP_TEXT =
   "اگه عجله داری، یه عکس با کپشن به این فرمت بفرست:\n\n" +
   "نام: گردنبند طرح ظریف\n" +
   "دسته: گردنبند\n" +
+  "مدل: زنجیری\n" +
   "عیار: 18\n" +
   "وزن: 4.2\n" +
+  "موجودی: 3\n" +
   "اجرت: 18\n" +
   "برچسب: پرفروش\n" +
   "نمایش: بله\n\n" +
   "دسته: گردنبند/دستبند/انگشتر/گوشواره/شمش\n" +
   "عیار: 18 یا 24\n" +
+  "مدل اختیاریه — برای دسته‌هایی که چند مدل/طرح دارن.\n" +
+  "موجودی اختیاریه — اگه ندی صفر در نظر گرفته می‌شه.\n" +
   "اجرت اختیاریه — اگه ندی از تنظیمات پیش‌فرض استفاده میشه.\n" +
   "برچسب و «نمایش» (نمایش در صفحه اصلی) هم اختیاری‌ان — پیش‌فرض «خیر».\n\n" +
   "برای افزودن سریع محصول مشابه قبلی، از دکمه «➕ مشابه همین» بعد از ثبت هر محصول استفاده کن — دیگه لازم نیست دسته/عیار/اجرت رو دوباره بزنی.\n\n" +
+  "برای ویرایش دسته، مدل، عیار، وزن، موجودی، اجرت، برچسب یا نمایش یک محصول، از دکمه «✏️ ویرایش محصول» تو پنل استفاده کن.\n\n" +
   "دستورهای دیگه:\n" +
   "/start - پنل مدیریت\n" +
   "/list - لیست محصولات\n" +
+  "/backup - تهیه فوری فایل پشتیبان (JSON)\n" +
   "/delete <id> - حذف محصول";
 
 // ============================================================
@@ -748,8 +1032,10 @@ async function handleNewItem(msg, env) {
     id: nextId,
     name: fields.name,
     category: fields.category,
+    model: fields.model || null,
     karat: karatVal,
     weight: parseFloat(fields.weight),
+    stock: fields.stock ? (parseInt(fields.stock, 10) || 0) : 0,
     makingFee: fields.fee ? parseFloat(fields.fee) : defaultFee,
     badge: fields.badge || null,
     featured: featuredVal,
@@ -766,7 +1052,7 @@ async function handleNewItem(msg, env) {
 
 function parseCaption(caption) {
   const fields = {};
-  const map = { "نام": "name", "دسته": "category", "عیار": "karat", "وزن": "weight", "اجرت": "fee", "برچسب": "badge", "نمایش": "featured" };
+  const map = { "نام": "name", "دسته": "category", "مدل": "model", "عیار": "karat", "وزن": "weight", "موجودی": "stock", "اجرت": "fee", "برچسب": "badge", "نمایش": "featured" };
   caption.split("\n").forEach(function (line) {
     const idx = line.indexOf(":");
     if (idx === -1) return;
@@ -810,7 +1096,126 @@ function arrayBufferToBase64(buffer) {
 //  لیست / حذف محصولات
 // ============================================================
 function formatItemLine(it) {
-  return "#" + it.id + " - " + it.name + " (" + it.category + ", " + it.karat + " عیار, " + it.weight + " گرم)" + (it.featured ? " ⭐" : "");
+  const catTxt = it.category + (it.model ? " - " + it.model : "");
+  const stockTxt = typeof it.stock === "number" ? (it.stock > 0 ? it.stock + " عدد" : "ناموجود ⚠️") : "نامشخص";
+  return "#" + it.id + " - " + it.name + " (" + catTxt + ", " + it.karat + " عیار, " + it.weight + " گرم, موجودی: " + stockTxt + ")" + (it.featured ? " ⭐" : "");
+}
+
+// ============================================================
+//  ویرایش محصول (دسته/مدل/عیار/وزن/موجودی/اجرت/برچسب/ویژه)
+// ============================================================
+function formatItemDetail(it) {
+  const stockTxt = typeof it.stock === "number" ? it.stock + " عدد" : "نامشخص";
+  return (
+    "محصول #" + it.id + "\n" +
+    "نام: " + it.name + "\n" +
+    "دسته: " + it.category + (it.model ? " (مدل: " + it.model + ")" : "") + "\n" +
+    "عیار: " + it.karat + " عیار\n" +
+    "وزن: " + it.weight + " گرم\n" +
+    "موجودی: " + stockTxt + "\n" +
+    "اجرت: " + it.makingFee + "٪\n" +
+    "برچسب: " + (it.badge || "—") + "\n" +
+    "نمایش در صفحه اصلی: " + (it.featured ? "بله ✅" : "خیر")
+  );
+}
+
+function editFieldsKeyboard(id) {
+  return [
+    [{ text: "نام", callback_data: "editf:" + id + ":name" }, { text: "دسته", callback_data: "editf:" + id + ":category" }],
+    [{ text: "مدل", callback_data: "editf:" + id + ":model" }, { text: "عیار", callback_data: "editf:" + id + ":karat" }],
+    [{ text: "وزن", callback_data: "editf:" + id + ":weight" }, { text: "موجودی", callback_data: "editf:" + id + ":stock" }],
+    [{ text: "اجرت", callback_data: "editf:" + id + ":fee" }, { text: "برچسب", callback_data: "editf:" + id + ":badge" }],
+    [{ text: "نمایش در صفحه اصلی", callback_data: "editf:" + id + ":featured" }],
+    [{ text: "« بازگشت به لیست", callback_data: "editmenu:0" }, { text: "🏠 منو", callback_data: "menu" }],
+  ];
+}
+
+function editCategoryKeyboard(id) {
+  return [
+    [{ text: "گردنبند", callback_data: "setcat:" + id + ":گردنبند" }, { text: "دستبند", callback_data: "setcat:" + id + ":دستبند" }],
+    [{ text: "انگشتر", callback_data: "setcat:" + id + ":انگشتر" }, { text: "گوشواره", callback_data: "setcat:" + id + ":گوشواره" }],
+    [{ text: "شمش", callback_data: "setcat:" + id + ":شمش" }],
+    [{ text: "انصراف", callback_data: "edit:" + id }],
+  ];
+}
+
+function editKaratKeyboard(id) {
+  return [
+    [{ text: "18 عیار", callback_data: "setkarat:" + id + ":18" }, { text: "24 عیار", callback_data: "setkarat:" + id + ":24" }],
+    [{ text: "انصراف", callback_data: "edit:" + id }],
+  ];
+}
+
+function editBadgeKeyboard(id) {
+  return [
+    [{ text: "پرفروش", callback_data: "setbadge:" + id + ":پرفروش" }, { text: "جدید", callback_data: "setbadge:" + id + ":جدید" }],
+    [{ text: "هیچکدام", callback_data: "setbadge:" + id + ":none" }],
+    [{ text: "انصراف", callback_data: "edit:" + id }],
+  ];
+}
+
+function editFeaturedKeyboard(id) {
+  return [
+    [{ text: "✅ بله", callback_data: "setfeatured:" + id + ":yes" }, { text: "خیر", callback_data: "setfeatured:" + id + ":no" }],
+    [{ text: "انصراف", callback_data: "edit:" + id }],
+  ];
+}
+
+async function showEditFieldMenu(chatId, messageId, env, id) {
+  const items = await getItems(env);
+  const item = items.find((it) => it.id === id);
+  if (!item) {
+    await editMessage(chatId, messageId, "محصول پیدا نشد.", env, [[{ text: "« بازگشت به لیست", callback_data: "editmenu:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+  await editMessage(chatId, messageId, formatItemDetail(item) + "\n\nکدوم مورد رو ویرایش کنم؟", env, editFieldsKeyboard(id));
+}
+
+async function updateItemField(env, id, field, value) {
+  const items = await getItems(env);
+  const item = items.find((it) => it.id === id);
+  if (!item) return null;
+  item[field] = value;
+  await saveItems(items, env);
+  return item;
+}
+
+async function handleEditValueInput(state, msg, chatId, env) {
+  if (!msg.text) return false;
+  const parts = state.split(":");
+  const id = parseInt(parts[1]);
+  const field = parts[2];
+  const raw = msg.text.trim();
+
+  let value;
+  if (field === "weight" || field === "fee") {
+    value = parseFloat(raw);
+    if (isNaN(value)) {
+      await sendMessage(chatId, "عدد نامعتبره. دوباره امتحان کن:", env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
+      return true;
+    }
+  } else if (field === "stock") {
+    value = parseInt(raw, 10);
+    if (isNaN(value) || value < 0) {
+      await sendMessage(chatId, "عدد نامعتبره. تعداد موجودی رو به‌صورت عدد صحیح بفرست:", env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
+      return true;
+    }
+  } else if (field === "model") {
+    const noneVal = /^(ندارد|نداره|no|none|-|خیر)$/i.test(raw);
+    value = noneVal ? null : raw;
+  } else {
+    value = raw;
+  }
+
+  const targetField = field === "fee" ? "makingFee" : field;
+  await env.SHOP_DB.delete("state:" + chatId);
+  const item = await updateItemField(env, id, targetField, value);
+  if (!item) {
+    await sendMessage(chatId, "محصول پیدا نشد.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
+    return true;
+  }
+  await sendMessage(chatId, "به‌روزرسانی شد ✅\n\n" + formatItemDetail(item), env, editFieldsKeyboard(id));
+  return true;
 }
 
 function buildItemListView(items, page, mode) {
@@ -824,15 +1229,20 @@ function buildItemListView(items, page, mode) {
   if (items.length === 0) {
     text = "هنوز محصولی ثبت نشده.";
   } else {
-    text = (mode === "delete" ? "برای حذف روی محصول بزن:" : "لیست محصولات (صفحه " + (page + 1) + " از " + totalPages + "):") + "\n\n" + pageItems.map(formatItemLine).join("\n");
+    const headTxt = mode === "delete" ? "برای حذف روی محصول بزن:" : mode === "edit" ? "برای ویرایش روی محصول بزن:" : "لیست محصولات (صفحه " + (page + 1) + " از " + totalPages + "):";
+    text = headTxt + "\n\n" + pageItems.map(formatItemLine).join("\n");
     if (mode === "delete") {
       pageItems.forEach((it) => keyboard.push([{ text: "🗑 حذف #" + it.id + " - " + it.name, callback_data: "del:" + it.id }]));
     }
+    if (mode === "edit") {
+      pageItems.forEach((it) => keyboard.push([{ text: "✏️ #" + it.id + " - " + it.name, callback_data: "edit:" + it.id }]));
+    }
   }
 
+  const navPrefix = mode === "delete" ? "delmenu:" : mode === "edit" ? "editmenu:" : "list:";
   const navRow = [];
-  if (page > 0) navRow.push({ text: "« قبلی", callback_data: (mode === "delete" ? "delmenu:" : "list:") + (page - 1) });
-  if (start + PAGE_SIZE < items.length) navRow.push({ text: "بعدی »", callback_data: (mode === "delete" ? "delmenu:" : "list:") + (page + 1) });
+  if (page > 0) navRow.push({ text: "« قبلی", callback_data: navPrefix + (page - 1) });
+  if (start + PAGE_SIZE < items.length) navRow.push({ text: "بعدی »", callback_data: navPrefix + (page + 1) });
   if (navRow.length) keyboard.push(navRow);
 
   keyboard.push([{ text: "🏠 منو", callback_data: "menu" }]);
@@ -894,16 +1304,24 @@ async function buildStatsText(env) {
   const byCategory = {};
   let totalWeight = 0;
   let featuredCount = 0;
+  let totalStock = 0;
+  let outOfStockCount = 0;
   items.forEach((it) => {
     byCategory[it.category] = (byCategory[it.category] || 0) + 1;
     totalWeight += it.weight || 0;
     if (it.featured) featuredCount += 1;
+    if (typeof it.stock === "number") {
+      totalStock += it.stock;
+      if (it.stock <= 0) outOfStockCount += 1;
+    }
   });
 
   let text = "📊 آمار فروشگاه\n\n";
   text += "تعداد کل محصولات: " + items.length + "\n";
   text += "تعداد ویژه (صفحه اصلی): " + featuredCount + "\n";
-  text += "مجموع وزن: " + totalWeight.toFixed(2) + " گرم\n\n";
+  text += "مجموع وزن: " + totalWeight.toFixed(2) + " گرم\n";
+  text += "مجموع موجودی انبار: " + totalStock + " عدد\n";
+  text += "محصولات ناموجود: " + outOfStockCount + "\n\n";
   text += "بر اساس دسته:\n";
   Object.keys(byCategory).forEach((cat) => {
     text += "- " + cat + ": " + byCategory[cat] + "\n";
