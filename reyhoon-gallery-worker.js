@@ -13,46 +13,45 @@ const PAGE_SIZE = 5;
 
 const DEFAULT_SETTINGS = { fee18: 20, fee24: 4 };
 
-// تبدیل ارقام فارسی (۰-۹) و عربی (٠-٩) به انگلیسی، چون کیبورد فارسی موبایل پیش‌فرض
-// این ارقام رو می‌فرسته و parseFloat/parseInt انگلیسی نمی‌فهمتشون (NaN می‌ده و بی‌صدا رد می‌شه)
-function normalizeDigits(str) {
-  return String(str)
-    .replace(/[۰-۹]/g, (d) => "۰۱۲۳۴۵۶۷۸۹".indexOf(d))
-    .replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d))
-    .replace(/[,٬،]/g, "") // جداکننده هزارگان
-    .trim();
+// آدرس سایت فروشگاه (برای ساخت لینک فاکتور که تو تلگرام فرستاده می‌شه)
+// نکته مهم: این مقدار قبلاً هاردکد و روی یه دامنه‌ی اشتباه/قدیمی بود، برای همین لینک فاکتور
+// تو ربات کار نمی‌کرد ولی برای مشتری (که از مسیر نسبی داخل همون سایت میره) مشکلی نداشت.
+// حالا از متغیر محیطی SITE_URL (تو wrangler.toml یا داشبورد Cloudflare) خونده می‌شه.
+const SITE_URL_FALLBACK = "https://reyhoongoldgallery.pages.dev";
+function siteUrl(env) {
+  return (env.SITE_URL || SITE_URL_FALLBACK).replace(/\/$/, "");
 }
 
-// آدرس سایت فروشگاه (برای ساخت لینک فاکتور که تو تلگرام فرستاده می‌شه) — اینو با دامنه واقعی سایتت جایگزین کن
-const SITE_URL = "https://reyhoongoldgallery.pages.dev";
+function orderStatusLabel(status) {
+  return {
+    pending: "در انتظار بررسی",
+    in_progress: "در حال انجام",
+    completed: "تکمیل شده",
+    rejected: "رد شده",
+  }[status] || status;
+}
+
+function buildInvoiceUrl(order, env, opts) {
+  opts = opts || {};
+  let url = siteUrl(env) + "/invoice.html?ticket=" + order.ticketNumber + "&token=" + order.invoiceToken;
+  if (opts.auto) url += "&auto=1";
+  return url;
+}
+
 
 // ============================================================
-//  همکاران ادمین و قابلیت‌های دسترسی (تک‌تک، قابل فعال/غیرفعال‌سازی)
+//  همکاران ادمین و سطوح دسترسی
+//  سطوح: orders (۱) < products (۲) < full (۳) < owner (۴)
 // ============================================================
-const PERM_LABEL = {
-  orders: "🎫 سفارش‌ها و تیکت‌ها",
-  products: "✏️ افزودن/ویرایش محصول",
-  delete_product: "🗑 حذف محصول",
-  discounts: "🏷 کدهای تخفیف",
-  settings: "⚙️ تنظیمات اجرت",
-  stats: "📊 آمار فروشگاه",
-  backup: "💾 بک‌آپ",
-  manage_admins: "👥 مدیریت همکاران",
+const ROLE_LABEL = {
+  orders: "سفارش‌ها و تیکت‌ها",
+  products: "محصولات + سفارش‌ها",
+  full: "کامل (بجز بک‌آپ و مدیریت همکاران)",
+  owner: "مالک",
 };
-const PERM_ORDER = ["orders", "products", "delete_product", "discounts", "settings", "stats", "backup", "manage_admins"];
-const DEFAULT_NEW_PERMS = ["orders"]; // پیش‌فرض وقتی همکار جدید اضافه می‌شه
 
-// role می‌تونه یکی از این‌ها باشه: "owner" (رشته) | آرایه‌ای از perm ها | null (بدون دسترسی)
-function hasPerm(role, perm) {
-  if (!perm) return !!role; // فقط لازمه یه سطح دسترسی (هرچی) داشته باشه
-  if (role === "owner") return true;
-  if (!role) return false;
-  return role.includes(perm);
-}
-
-function permsLabel(perms) {
-  if (!perms || !perms.length) return "بدون قابلیت فعال";
-  return perms.map((p) => PERM_LABEL[p] || p).join("، ");
+function roleLevel(role) {
+  return { orders: 1, products: 2, full: 3, owner: 4 }[role] || 0;
 }
 
 async function getCoAdmins(env) {
@@ -64,32 +63,29 @@ async function saveCoAdmins(list, env) {
   await env.SHOP_DB.put("co_admins", JSON.stringify(list));
 }
 
-// تبدیل ساختار قدیمی (role تکی) به آرایه perms، برای همکارهایی که قبل از این آپدیت اضافه شدن
-function migrateOldRole(role) {
-  if (role === "products") return ["orders", "products"];
-  if (role === "full") return ["orders", "products", "discounts", "settings", "stats", "backup"];
-  return ["orders"]; // role === "orders" یا نامشخص
-}
-
-// خروجی: "owner" یا آرایه perms یا null
 async function getAdminRole(chatId, env) {
   chatId = String(chatId);
   if (chatId === String(env.ADMIN_ID)) return "owner";
   const list = await getCoAdmins(env);
   const found = list.find((a) => String(a.chatId) === chatId);
-  if (!found) return null;
-  if (found.perms) return found.perms;
-  return migrateOldRole(found.role); // هنوز فرمت قدیمی داره، تا وقتی از /addadmin دوباره ثبت بشه
+  return found ? found.role : null;
 }
 
-// قابلیت لازم برای هر دکمه/اکشن پنل — null یعنی فقط داشتن هر نوع دسترسی کافیه (منو، لیست، تیکت‌ها، تایید/رد سفارش)
-function callbackRequiredPerm(data) {
-  if (data.startsWith("del:") || data.startsWith("delmenu:")) return "delete_product";
-  if (data === "admins" || data.startsWith("deladmin:") || data.startsWith("ap:") || data === "apconfirm" || data === "apcancel") return "manage_admins";
-  if (data === "settings" || data.startsWith("setfee:")) return "settings";
-  if (data === "discounts" || data === "newcode" || data.startsWith("disctype:") || data.startsWith("delcode:")) return "discounts";
-  if (data === "stats" || data === "favstats") return "stats";
-  if (data === "dobackup") return "backup";
+// حداقل سطح لازم برای هر دکمه/اکشن پنل — پیش‌فرض ۱ (پایین‌ترین سطح: سفارش‌ها) برای هرچیزی که اینجا لیست نشده
+function callbackRequiredLevel(data) {
+  if (data === "admins" || data.startsWith("deladmin:") || data === "dobackup") {
+    return 4; // فقط مالک: مدیریت همکاران، بک‌آپ
+  }
+  if (
+    data.startsWith("del:") || data.startsWith("delmenu:") ||
+    data === "settings" || data.startsWith("setfee:") ||
+    data === "discounts" || data === "newcode" || data.startsWith("disctype:") || data.startsWith("delcode:") ||
+    data === "stats" || data === "favstats" ||
+    data.startsWith("users:") || data.startsWith("viewuser:") || data.startsWith("edituser:") ||
+    data.startsWith("resetpass:") || data.startsWith("deluser")
+  ) {
+    return 3; // سطح کامل
+  }
   if (
     data === "newitem" || data === "newitem_cancel" || data === "newitem_confirm" || data === "newitem_like" ||
     data === "newphoto_done" || data === "addhelp" ||
@@ -99,28 +95,20 @@ function callbackRequiredPerm(data) {
     data.startsWith("delimg:") || data.startsWith("newcat:") || data.startsWith("newkarat:") ||
     data.startsWith("newbadge:") || data.startsWith("newfeatured:") || data.startsWith("newfee:")
   ) {
-    return "products";
+    return 2; // سطح محصولات
   }
-  return null; // عمومی/ناوبری
+  return 1; // سطح سفارش‌ها (و هرچیز عمومی/ناوبری مثل منو، لیست، تیکت‌ها، تایید/رد سفارش)
 }
 
-function buildPermToggleKeyboard(targetId, perms) {
-  const rows = PERM_ORDER.map((p) => [{
-    text: (perms.includes(p) ? "✅ " : "☐ ") + PERM_LABEL[p],
-    callback_data: "ap:" + p,
-  }]);
-  rows.push([{ text: "✔️ تایید و افزودن همکار", callback_data: "apconfirm" }]);
-  rows.push([{ text: "انصراف", callback_data: "apcancel" }]);
-  return rows;
-}
-
-async function startAddAdminFlow(text, chatId, env) {
+async function handleAddAdminCommand(text, chatId, env) {
   const parts = text.trim().split(/\s+/);
   const targetId = parts[1];
-  if (!targetId || !/^\d+$/.test(targetId)) {
+  const role = parts[2];
+  const validRoles = ["orders", "products", "full"];
+  if (!targetId || !/^\d+$/.test(targetId) || !validRoles.includes(role)) {
     await sendMessage(
       chatId,
-      "فرمت درست نیست. اینجوری بفرست:\n/addadmin <chat_id>\n\nمثال:\n/addadmin 123456789\n\nبعدش قابلیت‌هایی که می‌خوای براش فعال بشه رو تک‌تک از روی دکمه‌ها انتخاب می‌کنی.\n\n(همکارت باید اول تو همین ربات /whoami رو بزنه تا chat id خودش رو بگیره و بهت بده)",
+      "فرمت درست نیست. اینجوری بفرست:\n/addadmin <chat_id> <role>\n\nrole یکی از این‌ها:\norders (فقط سفارش‌ها و تیکت‌ها)\nproducts (محصولات + سفارش‌ها)\nfull (همه‌چی بجز بک‌آپ و مدیریت همکاران)\n\nمثال:\n/addadmin 123456789 products\n\n(همکارت باید اول تو همین ربات /whoami رو بزنه تا chat id خودش رو بگیره و بهت بده)",
       env
     );
     return;
@@ -131,55 +119,22 @@ async function startAddAdminFlow(text, chatId, env) {
   }
   const list = await getCoAdmins(env);
   const existing = list.find((a) => String(a.chatId) === targetId);
-  const perms = existing ? [...(existing.perms || migrateOldRole(existing.role))] : [...DEFAULT_NEW_PERMS];
-  await env.SHOP_DB.put("addadmindraft:" + chatId, JSON.stringify({ targetId, perms }));
-  await sendMessage(
-    chatId,
-    (existing ? "ویرایش قابلیت‌های همکار " : "قابلیت‌های همکار جدید ") + targetId + " رو انتخاب کن (با زدن هرکدوم فعال/غیرفعال می‌شه):",
-    env,
-    buildPermToggleKeyboard(targetId, perms)
-  );
-}
-
-async function handleAddAdminToggle(chatId, messageId, perm, env) {
-  const raw = await env.SHOP_DB.get("addadmindraft:" + chatId);
-  if (!raw) return;
-  const draft = JSON.parse(raw);
-  const idx = draft.perms.indexOf(perm);
-  if (idx >= 0) draft.perms.splice(idx, 1);
-  else draft.perms.push(perm);
-  await env.SHOP_DB.put("addadmindraft:" + chatId, JSON.stringify(draft));
-  await editMessage(
-    chatId, messageId,
-    "قابلیت‌های همکار " + draft.targetId + " رو انتخاب کن (با زدن هرکدوم فعال/غیرفعال می‌شه):",
-    env,
-    buildPermToggleKeyboard(draft.targetId, draft.perms)
-  );
-}
-
-async function handleAddAdminConfirm(chatId, messageId, env) {
-  const raw = await env.SHOP_DB.get("addadmindraft:" + chatId);
-  if (!raw) return;
-  const draft = JSON.parse(raw);
-  const list = await getCoAdmins(env);
-  const existing = list.find((a) => String(a.chatId) === draft.targetId);
   if (existing) {
-    existing.perms = draft.perms;
+    existing.role = role;
   } else {
-    list.push({ chatId: draft.targetId, perms: draft.perms, addedAt: Date.now() });
+    list.push({ chatId: targetId, role, addedAt: Date.now() });
   }
   await saveCoAdmins(list, env);
-  await env.SHOP_DB.delete("addadmindraft:" + chatId);
-  await editMessage(
-    chatId, messageId,
-    "✅ همکار " + draft.targetId + " با این قابلیت‌ها ثبت شد:\n" + permsLabel(draft.perms),
+  await sendMessage(
+    chatId,
+    "✅ همکار با آیدی " + targetId + " با سطح دسترسی «" + ROLE_LABEL[role] + "» اضافه شد.",
     env,
     [[{ text: "👥 لیست همکاران", callback_data: "admins" }]]
   );
   try {
     await sendMessage(
-      draft.targetId,
-      "سلام! دسترسی مدیریت به فروشگاه ریحون گلد گالری برات فعال شد.\nقابلیت‌های فعال: " + permsLabel(draft.perms) + "\n\nبرای شروع /start رو بزن.",
+      targetId,
+      "سلام! دسترسی مدیریت به فروشگاه ریحون گلد گالری برات فعال شد.\nسطح دسترسی: " + ROLE_LABEL[role] + "\n\nبرای شروع /start رو بزن.",
       env
     );
   } catch (err) {
@@ -189,11 +144,11 @@ async function handleAddAdminConfirm(chatId, messageId, env) {
 
 async function sendAdminList(chatId, messageId, env) {
   const list = await getCoAdmins(env);
-  const rows = list.map((a) => [{ text: "🗑 " + a.chatId + " — " + permsLabel(a.perms || migrateOldRole(a.role)), callback_data: "deladmin:" + a.chatId }]);
+  const rows = list.map((a) => [{ text: "🗑 " + a.chatId + " — " + (ROLE_LABEL[a.role] || a.role), callback_data: "deladmin:" + a.chatId }]);
   rows.push([{ text: "« بازگشت", callback_data: "menu" }]);
   const text = list.length
-    ? "👥 همکاران فعلی:\nبرای حذف روی هرکدوم بزن.\n\nبرای افزودن همکار جدید یا ویرایش قابلیت‌ها:\n/addadmin <chat_id>"
-    : "هنوز همکاری اضافه نکردی.\n\nبرای افزودن:\n/addadmin <chat_id>\n\n(همکارت اول باید تو ربات /whoami رو بزنه تا chat id خودش رو بگیره)";
+    ? "👥 همکاران فعلی:\nبرای حذف روی هرکدوم بزن.\n\nبرای افزودن همکار جدید:\n/addadmin <chat_id> <role>\nrole: orders / products / full"
+    : "هنوز همکاری اضافه نکردی.\n\nبرای افزودن:\n/addadmin <chat_id> <role>\nrole: orders / products / full\n\n(همکارت اول باید تو ربات /whoami رو بزنه تا chat id خودش رو بگیره)";
   if (messageId) await editMessage(chatId, messageId, text, env, rows);
   else await sendMessage(chatId, text, env, rows);
 }
@@ -516,7 +471,7 @@ async function handleNewOrder(request, env) {
     "جمع کل: " + toToman(total) + " تومان";
 
   try {
-    await notifyAdmins(env, "orders", message, [
+    await notifyAdmins(env, 1, message, [
       [{ text: "✅ تایید سفارش", callback_data: "apporder:" + ticketNumber }, { text: "❌ رد سفارش", callback_data: "rejorder:" + ticketNumber }],
     ]);
   } catch (err) {
@@ -815,6 +770,95 @@ async function buildFavStatsText(env) {
 }
 
 // ============================================================
+//  کاربران ثبت‌نامی (پروفایل + علاقه‌مندی‌ها + تعداد سفارش‌ها، برای ادمین)
+// ============================================================
+async function listRegisteredUsers(env) {
+  const list = await env.SHOP_DB.list({ prefix: "user:" });
+  const users = [];
+  for (const key of list.keys) {
+    const raw = await env.SHOP_DB.get(key.name);
+    if (raw) users.push(JSON.parse(raw));
+  }
+  users.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return users;
+}
+
+async function editUsersListMessage(chatId, messageId, env, page) {
+  const users = await listRegisteredUsers(env);
+  const start = page * PAGE_SIZE;
+  const pageUsers = users.slice(start, start + PAGE_SIZE);
+  const totalPages = Math.max(1, Math.ceil(users.length / PAGE_SIZE));
+
+  let text;
+  const keyboard = [];
+
+  if (users.length === 0) {
+    text = "هنوز هیچ کاربری ثبت‌نام نکرده.";
+  } else {
+    text = "👤 کاربران ثبت‌نامی (صفحه " + (page + 1) + " از " + totalPages + "، مجموع " + users.length + " نفر):";
+    pageUsers.forEach((u) => {
+      keyboard.push([{ text: (u.name || "بدون نام") + " — " + u.phone, callback_data: "viewuser:" + u.phone }]);
+    });
+  }
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: "« قبلی", callback_data: "users:" + (page - 1) });
+  if (start + PAGE_SIZE < users.length) navRow.push({ text: "بعدی »", callback_data: "users:" + (page + 1) });
+  if (navRow.length) keyboard.push(navRow);
+
+  keyboard.push([{ text: "🏠 منو", callback_data: "menu" }]);
+
+  return editMessage(chatId, messageId, text, env, keyboard);
+}
+
+function userDetailKeyboard(phone) {
+  return [
+    [{ text: "✏️ ویرایش نام", callback_data: "edituser:" + phone }],
+    [{ text: "🔑 تنظیم رمز عبور جدید", callback_data: "resetpass:" + phone }],
+    [{ text: "🗑 حذف کاربر", callback_data: "deluser:" + phone }],
+    [{ text: "« بازگشت به لیست", callback_data: "users:0" }, { text: "🏠 منو", callback_data: "menu" }],
+  ];
+}
+
+async function deleteUserAccount(phone, env) {
+  await env.SHOP_DB.delete("user:" + phone);
+  await env.SHOP_DB.delete("favorites:" + phone);
+  const favUsers = await getFavUsers(env);
+  if (favUsers.includes(phone)) {
+    await saveFavUsers(favUsers.filter((p) => p !== phone), env);
+  }
+  // توجه: تاریخچه سفارش‌ها (orders_by_phone) و خود سفارش‌ها حذف نمی‌شن، چون سوابق مالی/تیکتن
+}
+
+async function buildUserDetailView(phone, env) {
+  const raw = await env.SHOP_DB.get("user:" + phone);
+  if (!raw) {
+    return { text: "این کاربر پیدا نشد.", keyboard: [[{ text: "« بازگشت به لیست", callback_data: "users:0" }, { text: "🏠 منو", callback_data: "menu" }]] };
+  }
+  const user = JSON.parse(raw);
+
+  const favIds = await getUserFavorites(phone, env);
+  const items = await getItems(env);
+  const favNames = favIds.map((id) => {
+    const it = items.find((i) => String(i.id) === String(id));
+    return it ? it.name : "(محصول حذف‌شده #" + id + ")";
+  });
+
+  const ordersRaw = await env.SHOP_DB.get("orders_by_phone:" + phone);
+  const ticketNumbers = ordersRaw ? JSON.parse(ordersRaw) : [];
+
+  const text =
+    "👤 " + (user.name || "بدون نام") + "\n" +
+    "شماره تماس: " + user.phone + "\n" +
+    "تاریخ عضویت: " + new Date(user.createdAt).toLocaleDateString("fa-IR") + "\n\n" +
+    "🧾 تعداد سفارش‌ها: " + ticketNumbers.length +
+    (ticketNumbers.length ? "\nشماره تیکت‌ها: " + ticketNumbers.slice(0, 10).join("، ") : "") + "\n\n" +
+    "❤️ علاقه‌مندی‌ها (" + favNames.length + "):\n" + (favNames.length ? favNames.join("\n") : "—");
+
+  return { text, keyboard: userDetailKeyboard(phone) };
+}
+
+// ============================================================
 //  فاکتور سفارش
 // ============================================================
 async function handleInvoiceData(request, env) {
@@ -827,7 +871,7 @@ async function handleInvoiceData(request, env) {
   if (!raw) return jsonResponse({ error: "سفارش پیدا نشد." }, 404);
   const order = JSON.parse(raw);
 
-  if (order.status !== "approved") {
+  if (order.status !== "in_progress" && order.status !== "completed") {
     return jsonResponse({ error: "فاکتور فقط بعد از تایید سفارش صادر می‌شه." }, 403);
   }
 
@@ -856,17 +900,20 @@ async function handleOrderDecision(data, chatId, messageId, env) {
 
   if (order.status !== "pending") {
     await editMessage(chatId, messageId,
-      "این سفارش قبلاً " + (order.status === "approved" ? "تایید" : "رد") + " شده.", env);
+      "این سفارش قبلاً " + orderStatusLabel(order.status) + " شده.", env);
     return;
   }
 
   if (approve) {
-    order.status = "approved";
+    order.status = "in_progress";
     await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
-    const invoiceUrl = SITE_URL + "/invoice.html?ticket=" + ticketNumber + "&token=" + order.invoiceToken;
+    const invoiceUrl = buildInvoiceUrl(order, env, { auto: true });
     await editMessage(chatId, messageId,
-      "✅ سفارش #" + ticketNumber + " تایید شد.\nموجودی انبار همون‌طوری که کم شده بود می‌مونه.", env,
-      [[{ text: "🧾 مشاهده / دانلود فاکتور", url: invoiceUrl }]]);
+      "✅ سفارش #" + ticketNumber + " تایید شد و رفت رو حالت «در حال انجام».\nموجودی انبار همون‌طوری که کم شده بود می‌مونه.", env,
+      [
+        [{ text: "🧾 مشاهده / دانلود فاکتور", url: invoiceUrl }],
+        [{ text: "✅ تکمیل شد", callback_data: "completeorder:" + ticketNumber }],
+      ]);
   } else {
     order.status = "rejected";
     await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
@@ -880,6 +927,150 @@ async function handleOrderDecision(data, chatId, messageId, env) {
   }
 }
 
+// ============================================================
+//  مدیریت سفارش‌ها (در حال انجام / تکمیل‌شده) — لیست، جزئیات، تکمیل، حذف
+// ============================================================
+async function listOrdersByStatus(status, env) {
+  const list = await env.SHOP_DB.list({ prefix: "order:" });
+  const orders = [];
+  for (const key of list.keys) {
+    const raw = await env.SHOP_DB.get(key.name);
+    if (!raw) continue;
+    const order = JSON.parse(raw);
+    if (order.status === status) orders.push(order);
+  }
+  orders.sort((a, b) => b.createdAt - a.createdAt);
+  return orders;
+}
+
+async function deleteOrder(ticketNumber, env) {
+  const raw = await env.SHOP_DB.get("order:" + ticketNumber);
+  if (raw) {
+    const order = JSON.parse(raw);
+    if (order.accountPhone) {
+      const idxRaw = await env.SHOP_DB.get("orders_by_phone:" + order.accountPhone);
+      if (idxRaw) {
+        const filtered = JSON.parse(idxRaw).filter((tn) => tn !== ticketNumber);
+        await env.SHOP_DB.put("orders_by_phone:" + order.accountPhone, JSON.stringify(filtered));
+      }
+    }
+  }
+  await env.SHOP_DB.delete("order:" + ticketNumber);
+}
+
+function ordersMenuKeyboard() {
+  return [
+    [{ text: "🚚 سفارش‌های در حال انجام", callback_data: "ordlist:in_progress:0" }],
+    [{ text: "✅ سفارش‌های تکمیل‌شده", callback_data: "ordlist:completed:0" }],
+    [{ text: "⏳ در انتظار تایید", callback_data: "ordlist:pending:0" }, { text: "❌ رد شده", callback_data: "ordlist:rejected:0" }],
+    [{ text: "🏠 منو", callback_data: "menu" }],
+  ];
+}
+
+async function editOrdersMenuMessage(chatId, messageId, env) {
+  await editMessage(chatId, messageId, "📦 مدیریت سفارش‌ها\nیکی از وضعیت‌ها رو انتخاب کن:", env, ordersMenuKeyboard());
+}
+
+const ORDER_LIST_TITLE = {
+  pending: "⏳ سفارش‌های در انتظار تایید",
+  in_progress: "🚚 سفارش‌های در حال انجام",
+  completed: "✅ سفارش‌های تکمیل‌شده",
+  rejected: "❌ سفارش‌های رد شده",
+};
+
+function formatOrderDate(ts) {
+  try {
+    const d = new Date(ts);
+    return d.toLocaleDateString("fa-IR") + " - " + d.toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    return "";
+  }
+}
+
+async function editOrderListMessage(chatId, messageId, env, status, page) {
+  const orders = await listOrdersByStatus(status, env);
+  const start = page * PAGE_SIZE;
+  const pageOrders = orders.slice(start, start + PAGE_SIZE);
+
+  let text;
+  const keyboard = [];
+
+  if (orders.length === 0) {
+    text = ORDER_LIST_TITLE[status] + "\nچیزی تو این لیست نیست.";
+  } else {
+    text = ORDER_LIST_TITLE[status] + " (" + orders.length + " مورد):";
+    pageOrders.forEach((o) => {
+      keyboard.push([{
+        text: "#" + o.ticketNumber + " — " + o.name + " (" + formatOrderDate(o.createdAt) + ")",
+        callback_data: "ordview:" + status + ":" + o.ticketNumber + ":" + page,
+      }]);
+      const actionRow = [];
+      if (status === "completed") {
+        actionRow.push({ text: "🧾 فاکتور", url: buildInvoiceUrl(o, env, { auto: true }) });
+      }
+      actionRow.push({ text: "🗑 حذف", callback_data: "orddel:" + o.ticketNumber + ":" + status + ":" + page });
+      keyboard.push(actionRow);
+    });
+  }
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: "« قبلی", callback_data: "ordlist:" + status + ":" + (page - 1) });
+  if (start + PAGE_SIZE < orders.length) navRow.push({ text: "بعدی »", callback_data: "ordlist:" + status + ":" + (page + 1) });
+  if (navRow.length) keyboard.push(navRow);
+
+  keyboard.push([{ text: "« بازگشت", callback_data: "ordersmenu" }, { text: "🏠 منو", callback_data: "menu" }]);
+
+  await editMessage(chatId, messageId, text, env, keyboard);
+}
+
+async function editOrderDetailMessage(chatId, messageId, env, status, ticketNumber, page) {
+  const raw = await env.SHOP_DB.get("order:" + ticketNumber);
+  if (!raw) {
+    await editMessage(chatId, messageId, "این سفارش پیدا نشد (شاید حذف شده).", env, [[{ text: "« بازگشت", callback_data: "ordlist:" + status + ":" + page }, { text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+  const order = JSON.parse(raw);
+  const itemLines = order.items.map((it) => "- " + it.name + " (" + it.karat + " عیار، " + it.weight + " گرم) x" + it.qty).join("\n");
+
+  const text =
+    "🧾 سفارش #" + order.ticketNumber + " — " + orderStatusLabel(order.status) + "\n\n" +
+    "نام: " + order.name + "\n" +
+    "تماس: " + order.phone + "\n" +
+    "آدرس: " + order.address + "\n" +
+    "تاریخ و ساعت ثبت: " + formatOrderDate(order.createdAt) + "\n\n" +
+    "اقلام:\n" + itemLines + "\n\n" +
+    "جمع کل: " + toToman(order.total) + " تومان";
+
+  const keyboard = [];
+  if (order.status === "in_progress") {
+    keyboard.push([{ text: "🧾 فاکتور", url: buildInvoiceUrl(order, env, { auto: true }) }, { text: "✅ تکمیل شد", callback_data: "completeorder:" + order.ticketNumber }]);
+  } else if (order.status === "completed") {
+    keyboard.push([{ text: "🧾 فاکتور", url: buildInvoiceUrl(order, env, { auto: true }) }]);
+  }
+  keyboard.push([{ text: "🗑 حذف سفارش", callback_data: "orddel:" + order.ticketNumber + ":" + status + ":" + page }]);
+  keyboard.push([{ text: "« بازگشت", callback_data: "ordlist:" + status + ":" + page }, { text: "🏠 منو", callback_data: "menu" }]);
+
+  await editMessage(chatId, messageId, text, env, keyboard);
+}
+
+async function handleCompleteOrder(chatId, messageId, ticketNumber, env) {
+  const raw = await env.SHOP_DB.get("order:" + ticketNumber);
+  if (!raw) {
+    await editMessage(chatId, messageId, "این سفارش پیدا نشد (شاید حذف شده).", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+  const order = JSON.parse(raw);
+  if (order.status !== "in_progress") {
+    await editMessage(chatId, messageId, "این سفارش الان تو وضعیت «در حال انجام» نیست.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+  order.status = "completed";
+  await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
+  const invoiceUrl = buildInvoiceUrl(order, env, { auto: true });
+  await editMessage(chatId, messageId,
+    "✅ سفارش #" + ticketNumber + " تکمیل شد.", env,
+    [[{ text: "🧾 مشاهده / دانلود فاکتور", url: invoiceUrl }], [{ text: "✅ لیست سفارش‌های تکمیل‌شده", callback_data: "ordlist:completed:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
+}
 
 // ============================================================
 //  پشتیبان‌گیری (Backup)
@@ -983,11 +1174,11 @@ function answerCallback(callbackQueryId, env, text) {
 }
 
 // ارسال پیام به مالک + هر همکاری که سطح دسترسیش کافیه (برای سفارش/تیکت جدید)
-async function notifyAdmins(env, perm, text, keyboard) {
+async function notifyAdmins(env, minLevel, text, keyboard) {
   const recipients = [String(env.ADMIN_ID)];
   const coAdmins = await getCoAdmins(env);
   for (const a of coAdmins) {
-    if (hasPerm(a.perms || migrateOldRole(a.role), perm)) recipients.push(String(a.chatId));
+    if (roleLevel(a.role) >= minLevel) recipients.push(String(a.chatId));
   }
   for (const chatId of recipients) {
     try {
@@ -1044,7 +1235,7 @@ async function handleAdminMessage(msg, chatId, env, role) {
   }
 
   if (msg.photo && msg.caption) {
-    if (!hasPerm(role, "products")) {
+    if (roleLevel(role) < 2) {
       await sendMessage(chatId, "⛔️ برای افزودن محصول دسترسی لازم رو نداری.", env);
       return;
     }
@@ -1068,7 +1259,7 @@ async function handleAdminMessage(msg, chatId, env, role) {
   }
 
   if (msg.text && msg.text.startsWith("/delete")) {
-    if (!hasPerm(role, "delete_product")) {
+    if (roleLevel(role) < 3) {
       await sendMessage(chatId, "⛔️ برای حذف محصول دسترسی لازم رو نداری.", env);
       return;
     }
@@ -1082,8 +1273,8 @@ async function handleAdminMessage(msg, chatId, env, role) {
   }
 
   if (msg.text === "/backup") {
-    if (!hasPerm(role, "backup")) {
-      await sendMessage(chatId, "⛔️ دسترسی لازم برای این کار رو نداری.", env);
+    if (role !== "owner") {
+      await sendMessage(chatId, "⛔️ بک‌آپ فقط برای مالک فروشگاهه.", env);
       return;
     }
     await sendMessage(chatId, "در حال تهیه بک‌آپ...", env);
@@ -1092,17 +1283,17 @@ async function handleAdminMessage(msg, chatId, env, role) {
   }
 
   if (msg.text && msg.text.startsWith("/addadmin")) {
-    if (!hasPerm(role, "manage_admins")) {
-      await sendMessage(chatId, "⛔️ دسترسی مدیریت همکاران رو نداری.", env);
+    if (role !== "owner") {
+      await sendMessage(chatId, "⛔️ مدیریت همکاران فقط برای مالک فروشگاهه.", env);
       return;
     }
-    await startAddAdminFlow(msg.text, chatId, env);
+    await handleAddAdminCommand(msg.text, chatId, env);
     return;
   }
 
   if (msg.text === "/admins") {
-    if (!hasPerm(role, "manage_admins")) {
-      await sendMessage(chatId, "⛔️ دسترسی مدیریت همکاران رو نداری.", env);
+    if (role !== "owner") {
+      await sendMessage(chatId, "⛔️ مدیریت همکاران فقط برای مالک فروشگاهه.", env);
       return;
     }
     await sendAdminList(chatId, null, env);
@@ -1188,7 +1379,7 @@ async function handlePendingState(state, msg, chatId, env) {
   }
 
   if (state === "new_weight") {
-    const val = parseFloat(normalizeDigits(msg.text));
+    const val = parseFloat(msg.text);
     if (isNaN(val)) {
       await sendMessage(chatId, "عدد نامعتبره. وزن رو به گرم بفرست (مثلاً 4.2):", env, cancelKeyboard());
       return true;
@@ -1222,7 +1413,7 @@ async function handlePendingState(state, msg, chatId, env) {
   }
 
   if (state === "new_fee_manual") {
-    const val = parseFloat(normalizeDigits(msg.text));
+    const val = parseFloat(msg.text);
     if (isNaN(val)) {
       await sendMessage(chatId, "عدد نامعتبره. درصد اجرت رو بفرست:", env, cancelKeyboard());
       return true;
@@ -1237,10 +1428,47 @@ async function handlePendingState(state, msg, chatId, env) {
     return await handleEditValueInput(state, msg, chatId, env);
   }
 
+  if (state.startsWith("edituser_name:")) {
+    const phone = state.split(":")[1];
+    await env.SHOP_DB.delete("state:" + chatId);
+    const raw = await env.SHOP_DB.get("user:" + phone);
+    if (!raw) {
+      await sendMessage(chatId, "این کاربر پیدا نشد.", env, [[{ text: "« بازگشت به لیست", callback_data: "users:0" }]]);
+      return true;
+    }
+    const user = JSON.parse(raw);
+    user.name = msg.text.trim();
+    await env.SHOP_DB.put("user:" + phone, JSON.stringify(user));
+    await sendMessage(chatId, "نام کاربر به‌روزرسانی شد ✅", env, [[{ text: "👤 مشاهده کاربر", callback_data: "viewuser:" + phone }]]);
+    return true;
+  }
+
+  if (state.startsWith("resetpass:")) {
+    const phone = state.split(":")[1];
+    await env.SHOP_DB.delete("state:" + chatId);
+    const newPassword = msg.text.trim();
+    if (newPassword.length < 4) {
+      await sendMessage(chatId, "رمز عبور باید حداقل ۴ کاراکتر باشه. دوباره از منوی کاربر تلاش کن.", env, [[{ text: "👤 مشاهده کاربر", callback_data: "viewuser:" + phone }]]);
+      return true;
+    }
+    const raw = await env.SHOP_DB.get("user:" + phone);
+    if (!raw) {
+      await sendMessage(chatId, "این کاربر پیدا نشد.", env, [[{ text: "« بازگشت به لیست", callback_data: "users:0" }]]);
+      return true;
+    }
+    const user = JSON.parse(raw);
+    const salt = generateRandomToken();
+    user.salt = salt;
+    user.passwordHash = await hashPassword(newPassword, salt);
+    await env.SHOP_DB.put("user:" + phone, JSON.stringify(user));
+    await sendMessage(chatId, "رمز عبور کاربر تغییر کرد ✅ (بهش اطلاع بده رمز جدیدش رو)", env, [[{ text: "👤 مشاهده کاربر", callback_data: "viewuser:" + phone }]]);
+    return true;
+  }
+
   if (state.startsWith("await_fee_")) {
     await env.SHOP_DB.delete("state:" + chatId);
     const key = state.replace("await_fee_", "");
-    const val = parseFloat(normalizeDigits(msg.text));
+    const val = parseFloat(msg.text);
     if (isNaN(val)) {
       await sendMessage(chatId, "عدد نامعتبره. دوباره از منوی تنظیمات تلاش کن.", env, [[{ text: "⚙️ تنظیمات اجرت", callback_data: "settings" }]]);
       return true;
@@ -1288,7 +1516,7 @@ async function handlePendingState(state, msg, chatId, env) {
 
   if (state === "disc_value") {
     const draft = await getDiscDraft(chatId, env);
-    const val = parseFloat(normalizeDigits(msg.text));
+    const val = parseFloat(msg.text);
     const invalid = isNaN(val) || val <= 0 || (draft.type === "percent" && val > 100);
     if (invalid) {
       await sendMessage(
@@ -1465,14 +1693,65 @@ async function handleCallbackQuery(cq, env) {
 
   await answerCallback(cq.id, env);
 
-  const required = callbackRequiredPerm(data);
-  if (!hasPerm(role, required)) {
+  const required = callbackRequiredLevel(data);
+  if (roleLevel(role) < required) {
     await editMessage(chatId, messageId, "⛔️ دسترسی لازم برای این کار رو نداری.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
     return;
   }
 
   if (data.startsWith("apporder:") || data.startsWith("rejorder:")) {
     await handleOrderDecision(data, chatId, messageId, env);
+    return;
+  }
+
+  if (data.startsWith("completeorder:")) {
+    const ticketNumber = parseInt(data.split(":")[1]);
+    await handleCompleteOrder(chatId, messageId, ticketNumber, env);
+    return;
+  }
+
+  if (data === "ordersmenu") {
+    await editOrdersMenuMessage(chatId, messageId, env);
+    return;
+  }
+
+  if (data.startsWith("ordlist:")) {
+    const parts = data.split(":");
+    const status = parts[1];
+    const page = parseInt(parts[2]) || 0;
+    await editOrderListMessage(chatId, messageId, env, status, page);
+    return;
+  }
+
+  if (data.startsWith("ordview:")) {
+    const parts = data.split(":");
+    const status = parts[1];
+    const ticketNumber = parseInt(parts[2]);
+    const page = parseInt(parts[3]) || 0;
+    await editOrderDetailMessage(chatId, messageId, env, status, ticketNumber, page);
+    return;
+  }
+
+  if (data.startsWith("orddelconfirm:")) {
+    const parts = data.split(":");
+    const ticketNumber = parseInt(parts[1]);
+    const status = parts[2];
+    const page = parseInt(parts[3]) || 0;
+    await deleteOrder(ticketNumber, env);
+    await editMessage(chatId, messageId, "🗑 سفارش #" + ticketNumber + " حذف شد.", env,
+      [[{ text: "« بازگشت به لیست", callback_data: "ordlist:" + status + ":" + page }, { text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+
+  if (data.startsWith("orddel:")) {
+    const parts = data.split(":");
+    const ticketNumber = parseInt(parts[1]);
+    const status = parts[2];
+    const page = parseInt(parts[3]) || 0;
+    await editMessage(chatId, messageId, "❗️ مطمئنی می‌خوای سفارش #" + ticketNumber + " رو کامل حذف کنی؟ این کار قابل بازگشت نیست.", env, [
+      [{ text: "✅ بله، حذفش کن", callback_data: "orddelconfirm:" + ticketNumber + ":" + status + ":" + page }],
+      [{ text: "انصراف", callback_data: "ordlist:" + status + ":" + page }],
+    ]);
     return;
   }
 
@@ -1497,22 +1776,6 @@ async function handleCallbackQuery(cq, env) {
     const targetId = data.slice("deladmin:".length);
     const list = await getCoAdmins(env);
     await saveCoAdmins(list.filter((a) => String(a.chatId) !== targetId), env);
-    await sendAdminList(chatId, messageId, env);
-    return;
-  }
-
-  if (data.startsWith("ap:")) {
-    await handleAddAdminToggle(chatId, messageId, data.slice("ap:".length), env);
-    return;
-  }
-
-  if (data === "apconfirm") {
-    await handleAddAdminConfirm(chatId, messageId, env);
-    return;
-  }
-
-  if (data === "apcancel") {
-    await env.SHOP_DB.delete("addadmindraft:" + chatId);
     await sendAdminList(chatId, messageId, env);
     return;
   }
@@ -1777,6 +2040,49 @@ async function handleCallbackQuery(cq, env) {
     return;
   }
 
+  if (data.startsWith("users:")) {
+    const page = parseInt(data.split(":")[1]) || 0;
+    await editUsersListMessage(chatId, messageId, env, page);
+    return;
+  }
+
+  if (data.startsWith("viewuser:")) {
+    const phone = data.slice("viewuser:".length);
+    const { text, keyboard } = await buildUserDetailView(phone, env);
+    await editMessage(chatId, messageId, text, env, keyboard);
+    return;
+  }
+
+  if (data.startsWith("edituser:")) {
+    const phone = data.slice("edituser:".length);
+    await env.SHOP_DB.put("state:" + chatId, "edituser_name:" + phone);
+    await editMessage(chatId, messageId, "نام جدید کاربر رو بفرست:", env, [[{ text: "انصراف", callback_data: "viewuser:" + phone }]]);
+    return;
+  }
+
+  if (data.startsWith("resetpass:")) {
+    const phone = data.slice("resetpass:".length);
+    await env.SHOP_DB.put("state:" + chatId, "resetpass:" + phone);
+    await editMessage(chatId, messageId, "رمز عبور جدید این کاربر رو بفرست (حداقل ۴ کاراکتر):", env, [[{ text: "انصراف", callback_data: "viewuser:" + phone }]]);
+    return;
+  }
+
+  if (data.startsWith("deluserconfirm:")) {
+    const phone = data.slice("deluserconfirm:".length);
+    await deleteUserAccount(phone, env);
+    await editMessage(chatId, messageId, "کاربر " + phone + " حذف شد ✅", env, [[{ text: "« بازگشت به لیست", callback_data: "users:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
+
+  if (data.startsWith("deluser:")) {
+    const phone = data.slice("deluser:".length);
+    await editMessage(chatId, messageId, "❗️ مطمئنی می‌خوای حساب کاربری " + phone + " رو کامل حذف کنی؟ این کار قابل بازگشت نیست (علاقه‌مندی‌هاش هم پاک می‌شه، ولی سوابق سفارش‌هاش می‌مونه).", env, [
+      [{ text: "✅ بله، حذفش کن", callback_data: "deluserconfirm:" + phone }],
+      [{ text: "انصراف", callback_data: "viewuser:" + phone }],
+    ]);
+    return;
+  }
+
   if (data === "discounts") {
     await sendDiscountList(chatId, messageId, env);
     return;
@@ -1839,7 +2145,19 @@ async function handleCallbackQuery(cq, env) {
 
   if (data.startsWith("viewtick:")) {
     const id = data.split(":")[1];
-    await editTicketDetailMessage(chatId, messageId, env, id);
+    await editTicketDetailMessage(chatId, messageId, env, id, "tickets:0");
+    return;
+  }
+
+  if (data.startsWith("tickethistory:")) {
+    const page = parseInt(data.split(":")[1]) || 0;
+    await editTicketHistoryMessage(chatId, messageId, env, page);
+    return;
+  }
+
+  if (data.startsWith("viewtickh:")) {
+    const id = data.split(":")[1];
+    await editTicketDetailMessage(chatId, messageId, env, id, "tickethistory:0");
     return;
   }
 
@@ -1864,38 +2182,45 @@ async function handleCallbackQuery(cq, env) {
 const DASHBOARD_TEXT = "پنل مدیریت گالری طلا 🏆\nیکی از گزینه‌ها رو انتخاب کن:";
 
 function dashboardKeyboard(role) {
+  const level = roleLevel(role);
   const rows = [];
 
-  if (hasPerm(role, "products")) {
+  if (level >= 2) {
     rows.push([{ text: "📋 لیست محصولات", callback_data: "list:0" }, { text: "✏️ ویرایش محصول", callback_data: "editmenu:0" }]);
   } else {
     rows.push([{ text: "📋 لیست محصولات", callback_data: "list:0" }]);
   }
 
   const row2 = [];
-  if (hasPerm(role, "delete_product")) row2.push({ text: "🗑 حذف محصول", callback_data: "delmenu:0" });
-  if (hasPerm(role, "stats")) row2.push({ text: "📊 آمار فروشگاه", callback_data: "stats" });
+  if (level >= 3) row2.push({ text: "🗑 حذف محصول", callback_data: "delmenu:0" });
+  if (level >= 3) row2.push({ text: "📊 آمار فروشگاه", callback_data: "stats" });
   if (row2.length) rows.push(row2);
 
   const row3 = [];
-  if (hasPerm(role, "settings")) row3.push({ text: "⚙️ تنظیمات اجرت", callback_data: "settings" });
+  if (level >= 3) row3.push({ text: "⚙️ تنظیمات اجرت", callback_data: "settings" });
   row3.push({ text: "🎫 تیکت‌های باز", callback_data: "tickets:0" });
   rows.push(row3);
 
-  if (hasPerm(role, "discounts")) {
+  rows.push([{ text: "📦 مدیریت سفارش‌ها", callback_data: "ordersmenu" }]);
+
+  if (level >= 3) {
     rows.push([{ text: "🏷 کدهای تخفیف", callback_data: "discounts" }]);
   }
 
+  if (level >= 3) {
+    rows.push([{ text: "👤 کاربران", callback_data: "users:0" }]);
+  }
+
   const row5 = [];
-  if (hasPerm(role, "products")) row5.push({ text: "➕ افزودن محصول جدید", callback_data: "newitem" });
-  if (hasPerm(role, "backup")) row5.push({ text: "💾 بک‌آپ فوری", callback_data: "dobackup" });
+  if (level >= 2) row5.push({ text: "➕ افزودن محصول جدید", callback_data: "newitem" });
+  if (role === "owner") row5.push({ text: "💾 بک‌آپ فوری", callback_data: "dobackup" });
   if (row5.length) rows.push(row5);
 
-  if (hasPerm(role, "products")) {
+  if (level >= 2) {
     rows.push([{ text: "📖 روش سریع (عکس+کپشن)", callback_data: "addhelp" }]);
   }
 
-  if (hasPerm(role, "manage_admins")) {
+  if (role === "owner") {
     rows.push([{ text: "👥 مدیریت همکاران", callback_data: "admins" }]);
   }
 
@@ -1949,7 +2274,7 @@ async function handleNewItem(msg, env) {
   const settings = await getSettings(env);
   const nextId = await getNextId(env);
 
-  const karatVal = parseInt(normalizeDigits(fields.karat));
+  const karatVal = parseInt(fields.karat);
   const defaultFee = karatVal === 24 ? settings.fee24 : settings.fee18;
   const featuredVal = fields.featured ? /^(بله|yes|true|1)$/i.test(fields.featured.trim()) : false;
 
@@ -1959,9 +2284,9 @@ async function handleNewItem(msg, env) {
     category: fields.category,
     model: fields.model || null,
     karat: karatVal,
-    weight: parseFloat(normalizeDigits(fields.weight)),
-    stock: fields.stock ? (parseInt(normalizeDigits(fields.stock), 10) || 0) : 0,
-    makingFee: fields.fee ? parseFloat(normalizeDigits(fields.fee)) : defaultFee,
+    weight: parseFloat(fields.weight),
+    stock: fields.stock ? (parseInt(fields.stock, 10) || 0) : 0,
+    makingFee: fields.fee ? parseFloat(fields.fee) : defaultFee,
     badge: fields.badge || null,
     featured: featuredVal,
     rating: 4.7,
@@ -2133,13 +2458,13 @@ async function handleEditValueInput(state, msg, chatId, env) {
 
   let value;
   if (field === "weight" || field === "fee") {
-    value = parseFloat(normalizeDigits(raw));
+    value = parseFloat(raw);
     if (isNaN(value)) {
       await sendMessage(chatId, "عدد نامعتبره. دوباره امتحان کن:", env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
       return true;
     }
   } else if (field === "stock") {
-    value = parseInt(normalizeDigits(raw), 10);
+    value = parseInt(raw, 10);
     if (isNaN(value) || value < 0) {
       await sendMessage(chatId, "عدد نامعتبره. تعداد موجودی رو به‌صورت عدد صحیح بفرست:", env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
       return true;
@@ -2234,7 +2559,7 @@ async function handleOrderLookup(text, chatId, env) {
   }
   const order = JSON.parse(raw);
   await sendMessage(chatId,
-    "تیکت #" + order.ticketNumber + " - وضعیت: " + order.status + "\n" +
+    "تیکت #" + order.ticketNumber + " - وضعیت: " + orderStatusLabel(order.status) + "\n" +
     order.name + " - " + order.phone + "\n" + order.address, env);
 }
 
@@ -2302,16 +2627,23 @@ async function closeTicket(id, env) {
   await saveTicket(ticket, env);
 }
 
+function ticketTypeLabel(type) {
+  if (type === "خرید") return "🛍 خرید";
+  if (type === "پشتیبانی" || !type) return "🛠 پشتیبانی";
+  return type;
+}
+
 async function notifyAdminNewTicketMessage(ticket, env) {
   const lastMsg = ticket.messages[ticket.messages.length - 1];
-  const text = "🎫 تیکت #" + ticket.id + " از " + (ticket.name || "کاربر سایت") + "\n\n" + lastMsg.text;
-  await notifyAdmins(env, "orders", text, [[{ text: "پاسخ", callback_data: "reply:" + ticket.id }, { text: "بستن تیکت", callback_data: "closetick:" + ticket.id }]]);
+  const text = "🎫 تیکت #" + ticket.id + " [" + ticketTypeLabel(ticket.type) + "] از " + (ticket.name || "کاربر سایت") + "\n\n" + lastMsg.text;
+  await notifyAdmins(env, 1, text, [[{ text: "پاسخ", callback_data: "reply:" + ticket.id }, { text: "بستن تیکت", callback_data: "closetick:" + ticket.id }]]);
 }
 
 async function handleCreateTicket(request, env) {
   const body = await request.json().catch(() => ({}));
   const name = (body.name || "کاربر سایت").toString().slice(0, 100);
   const message = (body.message || "").toString().slice(0, 2000);
+  const type = (body.type || "پشتیبانی").toString().slice(0, 30);
   if (!message) {
     return new Response(JSON.stringify({ error: "message is required" }), { status: 400, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
   }
@@ -2323,6 +2655,7 @@ async function handleCreateTicket(request, env) {
   const ticket = {
     id,
     name,
+    type,
     status: "open",
     messages: [{ from: "customer", text: message, time: Date.now() }],
     createdAt: Date.now(),
@@ -2377,6 +2710,17 @@ async function listOpenTickets(env) {
   return tickets;
 }
 
+async function listAllTickets(env) {
+  const list = await env.SHOP_DB.list({ prefix: "ticket:" });
+  const tickets = [];
+  for (const key of list.keys) {
+    const raw = await env.SHOP_DB.get(key.name);
+    if (raw) tickets.push(JSON.parse(raw));
+  }
+  tickets.sort((a, b) => b.updatedAt - a.updatedAt);
+  return tickets;
+}
+
 async function editTicketListMessage(chatId, messageId, env, page) {
   const tickets = await listOpenTickets(env);
   const start = page * PAGE_SIZE;
@@ -2391,7 +2735,7 @@ async function editTicketListMessage(chatId, messageId, env, page) {
     text = "🎫 تیکت‌های باز (" + tickets.length + " مورد):";
     pageTickets.forEach((t) => {
       const lastMsg = t.messages[t.messages.length - 1];
-      keyboard.push([{ text: "#" + t.id + " - " + t.name + ": " + lastMsg.text.slice(0, 20), callback_data: "viewtick:" + t.id }]);
+      keyboard.push([{ text: "#" + t.id + " [" + ticketTypeLabel(t.type) + "] " + t.name + ": " + lastMsg.text.slice(0, 20), callback_data: "viewtick:" + t.id }]);
     });
   }
 
@@ -2400,19 +2744,49 @@ async function editTicketListMessage(chatId, messageId, env, page) {
   if (start + PAGE_SIZE < tickets.length) navRow.push({ text: "بعدی »", callback_data: "tickets:" + (page + 1) });
   if (navRow.length) keyboard.push(navRow);
 
+  keyboard.push([{ text: "🗂 تاریخچه همه‌ی تیکت‌ها", callback_data: "tickethistory:0" }]);
   keyboard.push([{ text: "🏠 منو", callback_data: "menu" }]);
 
   return editMessage(chatId, messageId, text, env, keyboard);
 }
 
-async function editTicketDetailMessage(chatId, messageId, env, ticketId) {
+async function editTicketHistoryMessage(chatId, messageId, env, page) {
+  const tickets = await listAllTickets(env);
+  const start = page * PAGE_SIZE;
+  const pageTickets = tickets.slice(start, start + PAGE_SIZE);
+
+  let text;
+  const keyboard = [];
+
+  if (tickets.length === 0) {
+    text = "هنوز هیچ تیکتی ثبت نشده.";
+  } else {
+    text = "🗂 تاریخچه همه‌ی تیکت‌ها (" + tickets.length + " مورد، باز و بسته):";
+    pageTickets.forEach((t) => {
+      const statusTxt = t.status === "open" ? "باز" : "بسته";
+      keyboard.push([{ text: "#" + t.id + " [" + ticketTypeLabel(t.type) + "] " + t.name + " — " + statusTxt, callback_data: "viewtickh:" + t.id }]);
+    });
+  }
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: "« قبلی", callback_data: "tickethistory:" + (page - 1) });
+  if (start + PAGE_SIZE < tickets.length) navRow.push({ text: "بعدی »", callback_data: "tickethistory:" + (page + 1) });
+  if (navRow.length) keyboard.push(navRow);
+
+  keyboard.push([{ text: "« بازگشت به تیکت‌های باز", callback_data: "tickets:0" }, { text: "🏠 منو", callback_data: "menu" }]);
+
+  return editMessage(chatId, messageId, text, env, keyboard);
+}
+
+async function editTicketDetailMessage(chatId, messageId, env, ticketId, backTo) {
+  backTo = backTo || "tickets:0";
   const ticket = await getTicket(ticketId, env);
   if (!ticket) {
     await editMessage(chatId, messageId, "تیکت پیدا نشد.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
     return;
   }
 
-  let text = "🎫 تیکت #" + ticket.id + " - " + ticket.name + " (" + (ticket.status === "open" ? "باز" : "بسته") + ")\n\n";
+  let text = "🎫 تیکت #" + ticket.id + " [" + ticketTypeLabel(ticket.type) + "] - " + ticket.name + " (" + (ticket.status === "open" ? "باز" : "بسته") + ")\n\n";
   ticket.messages.slice(-10).forEach((m) => {
     text += (m.from === "admin" ? "من: " : ticket.name + ": ") + m.text + "\n";
   });
@@ -2421,7 +2795,7 @@ async function editTicketDetailMessage(chatId, messageId, env, ticketId) {
   if (ticket.status === "open") {
     keyboard.push([{ text: "✍️ پاسخ", callback_data: "reply:" + ticket.id }, { text: "بستن تیکت", callback_data: "closetick:" + ticket.id }]);
   }
-  keyboard.push([{ text: "« بازگشت به لیست تیکت‌ها", callback_data: "tickets:0" }, { text: "🏠 منو", callback_data: "menu" }]);
+  keyboard.push([{ text: "« بازگشت", callback_data: backTo }, { text: "🏠 منو", callback_data: "menu" }]);
 
   await editMessage(chatId, messageId, text, env, keyboard);
 }
