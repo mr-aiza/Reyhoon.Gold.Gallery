@@ -43,6 +43,13 @@
           </div>
           <nav class="main-nav">${navHTML}</nav>
           <div class="header-actions">
+            <a href="favorites.html" class="icon-btn" id="favBtn" aria-label="علاقه‌مندی‌ها">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8Z"/></svg>
+            </a>
+            <a href="account.html" class="icon-btn account-btn" id="accountBtn" aria-label="حساب کاربری">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21a8 8 0 0 0-16 0"/><circle cx="12" cy="7" r="4"/></svg>
+              <span class="account-label" id="accountLabel">ورود</span>
+            </a>
             <button class="icon-btn cart-btn" id="cartBtn" aria-label="سبد خرید">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
               <span class="cart-badge num" id="cartBadge" style="display:none;">0</span>
@@ -58,6 +65,20 @@
         </div>
         <nav>${mobileNavHTML}</nav>
       </div>`;
+
+    updateAccountLabel();
+  }
+
+  // متن دکمه‌ی حساب کاربری رو بر اساس وضعیت لاگین (از assets/auth.js) به‌روز می‌کنه
+  function updateAccountLabel(){
+    const label = document.getElementById("accountLabel");
+    if(!label) return;
+    if(window.ReyhoonAuth && window.ReyhoonAuth.isLoggedIn()){
+      const user = window.ReyhoonAuth.getUser();
+      label.textContent = (user && user.name) ? user.name.split(" ")[0] : "حساب من";
+    } else {
+      label.textContent = "ورود";
+    }
   }
 
   renderHeader();
@@ -76,6 +97,7 @@
   let PRODUCTS = [];
   let galleryLoaded = false;
   let galleryFailed = false;
+  const galleryLoadedCallbacks = [];
 
   // آدرس Worker گالری تلگرام رو اینجا بذار
   const GALLERY_API_URL = "https://reyhoongoldgallery.tempmail41245.workers.dev";
@@ -94,6 +116,7 @@
         galleryFailed = false;
         if(typeof renderModelFilters === "function") renderModelFilters();
         renderProducts();
+        galleryLoadedCallbacks.splice(0).forEach(cb => cb(PRODUCTS));
       }
     } catch(err){
       console.warn("اتصال به گالری تلگرام ناموفق بود:", err.message);
@@ -111,9 +134,12 @@
   let pricePerGram = 38450000;
   let history = Array.from({length:24}, (_,i) => 38450000 + Math.sin(i/3)*80000 + i*4000);
   let cart = [];
+  let appliedDiscount = null; // { code, type, value, label }
+  let favoriteIds = new Set();
   let activeCategory = "همه";
   let activeKarat = "همه";
   let lightboxIndex = -1;
+  let lightboxImgIndex = 0;
   let live24k = null;
   let liveEmami = null;
   let undoTimer = null;
@@ -121,6 +147,7 @@
 
   const toToman = n => Math.round(n).toLocaleString("fa-IR");
   let priceReady = false;
+  const priceReadyCallbacks = [];
   let previousLivePrice = null;
   const priceText = n => priceReady ? toToman(n) : "...";
   const price24kVal = () => usingLiveData && live24k ? live24k : pricePerGram*1.33;
@@ -155,6 +182,7 @@
           updateLiveIndicator();
           refreshAllUI();
           updatePriceChangeBadge(delta);
+          priceReadyCallbacks.splice(0).forEach(cb => cb());
           return;
         }
       }
@@ -218,8 +246,18 @@
     return `<svg viewBox="0 0 120 120" width="100%" height="100%"><path d="M60 35 L60 60" fill="none" stroke="${stroke}" stroke-width="1.4"/><circle cx="60" cy="72" r="13" fill="none" stroke="${stroke}" stroke-width="1.4"/></svg>`;
   }
 
-  function productVisual(p){
-    if(p.image) return `<img src="${p.image}" alt="${p.name}" style="width:100%;height:100%;object-fit:cover;border-radius:8px;">`;
+  function productImages(p){
+    if(Array.isArray(p.images) && p.images.length) return p.images;
+    if(p.image) return [p.image];
+    return null;
+  }
+
+  function productVisual(p, imgIndex){
+    const imgs = productImages(p);
+    if(imgs && imgs.length){
+      const idx = (typeof imgIndex === "number" && imgs[imgIndex]) ? imgIndex : 0;
+      return `<img src="${imgs[idx]}" alt="${p.name}" style="width:100%;height:100%;object-fit:cover;border-radius:8px;">`;
+    }
     return productArtSVG(p.art);
   }
 
@@ -327,6 +365,9 @@
           <div class="product-art" data-open="${p.id}" style="cursor:zoom-in;">
             ${badgeText ? `<span class="product-badge ${p.featured ? 'featured' : ''}">${badgeText}</span>` : ""}
             ${outOfStock ? `<span class="product-badge" style="background:#8B2E2E;color:#fff;">ناموجود</span>` : ""}
+            <button class="fav-btn${favoriteIds.has(String(p.id)) ? ' active' : ''}" data-fav="${p.id}" aria-label="افزودن به علاقه‌مندی‌ها" onclick="event.stopPropagation();">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="${favoriteIds.has(String(p.id)) ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8Z"/></svg>
+            </button>
             ${productVisual(p)}
           </div>
           <div class="product-info">
@@ -361,6 +402,72 @@
         openLightbox(id);
       });
     });
+
+    grid.querySelectorAll("[data-fav]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const id = parseInt(btn.getAttribute("data-fav"));
+        toggleFavorite(id);
+      });
+    });
+  }
+
+  // ---------- Favorites ----------
+  function showFavToast(){
+    let el = document.getElementById("favToast");
+    if(!el){
+      el = document.createElement("div");
+      el.id = "favToast";
+      el.className = "fav-toast";
+      el.innerHTML = `برای افزودن به علاقه‌مندی‌ها باید <a href="account.html">وارد حساب</a> بشی.`;
+      document.body.appendChild(el);
+    }
+    el.classList.add("show");
+    clearTimeout(el._hideTimer);
+    el._hideTimer = setTimeout(() => el.classList.remove("show"), 3000);
+  }
+
+  function updateFavButtonsUI(id){
+    const active = favoriteIds.has(String(id));
+    document.querySelectorAll(`[data-fav="${id}"]`).forEach(btn => setFavBtnActive(btn, active));
+    const favBtn = document.getElementById("lightboxFav");
+    if(favBtn && lightboxIndex !== -1){
+      const list = visibleProducts().length ? visibleProducts() : PRODUCTS;
+      const p = list[lightboxIndex];
+      if(p && p.id === id) setFavBtnActive(favBtn, active);
+    }
+  }
+
+  async function toggleFavorite(id){
+    if(!(window.ReyhoonAuth && window.ReyhoonAuth.isLoggedIn())){
+      showFavToast();
+      return;
+    }
+    const wasActive = favoriteIds.has(String(id));
+    // به‌روزرسانی خوش‌بینانه رابط کاربری
+    if(wasActive) favoriteIds.delete(String(id)); else favoriteIds.add(String(id));
+    updateFavButtonsUI(id);
+    try{
+      const data = await window.ReyhoonAuth.apiFetch("/api/favorites/toggle", {
+        method: "POST",
+        body: JSON.stringify({ itemId: String(id) }),
+      });
+      favoriteIds = new Set((data.favorites || []).map(String));
+      updateFavButtonsUI(id);
+    } catch(err){
+      // برگردوندن به حالت قبل در صورت خطا
+      if(wasActive) favoriteIds.add(String(id)); else favoriteIds.delete(String(id));
+      updateFavButtonsUI(id);
+    }
+  }
+
+  async function syncFavorites(){
+    if(!(window.ReyhoonAuth && window.ReyhoonAuth.isLoggedIn())) return;
+    try{
+      const data = await window.ReyhoonAuth.apiFetch("/api/favorites/mine", { method: "GET" });
+      favoriteIds = new Set((data.itemIds || []).map(String));
+      renderProducts();
+      if(lightboxIndex !== -1) renderLightbox();
+    } catch(err){ /* اگه توکن نامعتبر شده باشه، بی‌سروصدا رد می‌شیم */ }
   }
 
   function bumpCartBadge(){
@@ -395,6 +502,7 @@
     const list = visibleProducts().length ? visibleProducts() : PRODUCTS;
     lightboxIndex = list.findIndex(p => p.id === id);
     if(lightboxIndex === -1) return;
+    lightboxImgIndex = 0;
     renderLightbox(list);
     lightboxEl.classList.add("open");
   }
@@ -403,14 +511,53 @@
     list = list || (visibleProducts().length ? visibleProducts() : PRODUCTS);
     const p = list[lightboxIndex];
     if(!p) return;
-    const artEl = document.getElementById("lightboxArt");
-    artEl.querySelector("svg, img")?.remove();
-    artEl.insertAdjacentHTML("beforeend", productVisual(p));
+    renderLightboxImage(p);
     document.getElementById("lightboxName").textContent = p.name;
     document.getElementById("lightboxMeta").innerHTML =
       `<span class="star">★</span><span class="num">${p.rating}</span><span class="dot">· ${p.weight} گرم</span><span class="dot">· ${karatLabel(p.karat)}</span>`;
     document.getElementById("lightboxPrice").textContent = priceText(productPrice(p)) + " تومان";
     document.getElementById("lightboxAdd").onclick = () => addToCart(p.id);
+    const favBtn = document.getElementById("lightboxFav");
+    if(favBtn){
+      favBtn.onclick = () => toggleFavorite(p.id);
+      setFavBtnActive(favBtn, favoriteIds.has(String(p.id)));
+    }
+  }
+
+  function setFavBtnActive(btn, active){
+    btn.classList.toggle("active", active);
+    const svg = btn.querySelector("svg");
+    if(svg) svg.setAttribute("fill", active ? "currentColor" : "none");
+  }
+
+  // این تابع فقط تصویر + ردیف thumbnail رو رندر می‌کنه، بدون دست‌زدن به دکمه‌های
+  // بستن/قبلی/بعدی که کنارشون هستن. جایگزینی کامل innerHTML به‌جای querySelector
+  // تک‌المانی قبلی، باعث میشه هیچ تصویر اضافه‌ای از رندر قبلی باقی نمونه (رفع باگ).
+  function renderLightboxImage(p){
+    const wrap = document.getElementById("lightboxImgWrap");
+    if(wrap) wrap.innerHTML = productVisual(p, lightboxImgIndex);
+    renderLightboxThumbs(p);
+  }
+
+  function renderLightboxThumbs(p){
+    const thumbsEl = document.getElementById("lightboxThumbs");
+    if(!thumbsEl) return;
+    const imgs = productImages(p);
+    if(!imgs || imgs.length < 2){
+      thumbsEl.innerHTML = "";
+      thumbsEl.style.display = "none";
+      return;
+    }
+    thumbsEl.style.display = "flex";
+    thumbsEl.innerHTML = imgs.map((src, i) =>
+      `<div class="lightbox-thumb ${i === lightboxImgIndex ? 'active' : ''}" data-thumb="${i}"><img src="${src}" alt=""></div>`
+    ).join("");
+    thumbsEl.querySelectorAll("[data-thumb]").forEach(el => {
+      el.addEventListener("click", () => {
+        lightboxImgIndex = parseInt(el.dataset.thumb, 10);
+        renderLightboxImage(p);
+      });
+    });
   }
 
   function closeLightbox(){ lightboxEl && lightboxEl.classList.remove("open"); }
@@ -421,11 +568,13 @@
     document.getElementById("lightboxPrev").addEventListener("click", () => {
       const list = visibleProducts().length ? visibleProducts() : PRODUCTS;
       lightboxIndex = (lightboxIndex - 1 + list.length) % list.length;
+      lightboxImgIndex = 0;
       renderLightbox(list);
     });
     document.getElementById("lightboxNext").addEventListener("click", () => {
       const list = visibleProducts().length ? visibleProducts() : PRODUCTS;
       lightboxIndex = (lightboxIndex + 1) % list.length;
+      lightboxImgIndex = 0;
       renderLightbox(list);
     });
     document.addEventListener("keydown", (e) => {
@@ -571,6 +720,13 @@
 
   function cartTotal(){ return cart.reduce((sum, l) => sum + productPrice(l.product) * l.qty, 0); }
   function cartTotalWeight(){ return cart.reduce((sum, l) => sum + l.product.weight * l.qty, 0); }
+  function currentDiscountAmount(){
+    if(!appliedDiscount) return 0;
+    const subtotal = cartTotal();
+    if(appliedDiscount.type === "percent") return Math.round(subtotal * appliedDiscount.value / 100);
+    return Math.min(appliedDiscount.value, subtotal);
+  }
+  function cartFinalTotal(){ return Math.max(0, cartTotal() - currentDiscountAmount()); }
 
   function renderCart(){
     const badge = document.getElementById("cartBadge");
@@ -588,6 +744,7 @@
       list.innerHTML = "";
       empty.style.display = "flex";
       footer.style.display = "none";
+      appliedDiscount = null;
       saveCart();
       return;
     }
@@ -643,10 +800,82 @@
       });
     });
 
-    document.getElementById("cartTotalVal").textContent = toToman(cartTotal()) + " تومان";
+    document.getElementById("cartTotalVal").textContent = toToman(cartFinalTotal()) + " تومان";
     const weightNote = document.getElementById("cartWeightNote");
     if(weightNote) weightNote.textContent = "وزن کل: " + cartTotalWeight().toFixed(2) + " گرم";
+    renderDiscountUI();
     saveCart();
+  }
+
+  // ---------- Discount code ----------
+  function renderDiscountUI(){
+    const row = document.getElementById("discountRow");
+    const applied = document.getElementById("discountApplied");
+    const line = document.getElementById("discountLine");
+    const lineVal = document.getElementById("discountLineVal");
+    if(!row || !applied) return;
+    if(appliedDiscount){
+      row.style.display = "none";
+      applied.classList.add("show");
+      document.getElementById("discountAppliedText").textContent = "کد «" + appliedDiscount.code + "» — " + appliedDiscount.label;
+      if(line){ line.style.display = "flex"; lineVal.textContent = "- " + toToman(currentDiscountAmount()) + " تومان"; }
+    } else {
+      row.style.display = "flex";
+      applied.classList.remove("show");
+      if(line) line.style.display = "none";
+    }
+  }
+
+  function showDiscountError(text){
+    const el = document.getElementById("discountError");
+    if(!el) return;
+    el.textContent = text;
+    el.classList.add("show");
+  }
+  function clearDiscountError(){
+    const el = document.getElementById("discountError");
+    if(el){ el.textContent = ""; el.classList.remove("show"); }
+  }
+
+  const applyDiscountBtn = document.getElementById("applyDiscountBtn");
+  if(applyDiscountBtn){
+    applyDiscountBtn.addEventListener("click", async () => {
+      const input = document.getElementById("discountInput");
+      const code = (input.value || "").trim();
+      clearDiscountError();
+      if(!code) return;
+      if(!GALLERY_API_URL) return;
+      applyDiscountBtn.disabled = true;
+      applyDiscountBtn.textContent = "...";
+      try{
+        const res = await fetch(`${GALLERY_API_URL}/api/discount/check`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code, subtotal: cartTotal() }),
+        });
+        const data = await res.json();
+        if(data.valid){
+          appliedDiscount = { code: data.code, type: data.type, value: data.value, label: data.label };
+          input.value = "";
+          renderCart();
+        } else {
+          showDiscountError(data.error || "کد تخفیف معتبر نیست.");
+        }
+      } catch(err){
+        showDiscountError("مشکلی پیش اومد، دوباره تلاش کن.");
+      } finally {
+        applyDiscountBtn.disabled = false;
+        applyDiscountBtn.textContent = "اعمال";
+      }
+    });
+  }
+
+  const removeDiscountBtn = document.getElementById("removeDiscountBtn");
+  if(removeDiscountBtn){
+    removeDiscountBtn.addEventListener("click", () => {
+      appliedDiscount = null;
+      renderCart();
+    });
   }
 
   function removeFromCart(idx){
@@ -695,7 +924,12 @@
 
   function openCheckout(){
     if(cart.length === 0 || !checkoutModal) return;
-    document.getElementById("checkoutTotal").textContent = toToman(cartTotal()) + " تومان";
+    document.getElementById("checkoutTotal").textContent = toToman(cartFinalTotal()) + " تومان";
+    if(window.ReyhoonAuth && window.ReyhoonAuth.isLoggedIn()){
+      const user = window.ReyhoonAuth.getUser();
+      const phoneInput = document.getElementById("ckPhone");
+      if(phoneInput && !phoneInput.value && user && user.phone) phoneInput.value = user.phone;
+    }
     stepForm.style.display = "block";
     stepSuccess.style.display = "none";
     checkoutModal.classList.add("open");
@@ -743,6 +977,7 @@
       }));
 
       const lines = cart.map(l => `- ${l.product.name} (${karatLabel(l.product.karat)}، ${l.product.weight} گرم) × ${l.qty} — ${toToman(productPrice(l.product)*l.qty)} تومان`).join("\n");
+      const discountText = appliedDiscount ? `\nکد تخفیف: ${appliedDiscount.code} (-${toToman(currentDiscountAmount())} تومان)` : "";
       const message =
 `سفارش جدید از ریحون گلد گالری
 نام: ${name}
@@ -751,8 +986,8 @@
 
 اقلام:
 ${lines}
-
-جمع کل: ${toToman(cartTotal())} تومان`;
+${discountText}
+جمع کل: ${toToman(cartFinalTotal())} تومان`;
 
       const tgLink = `https://t.me/${SHOP_TELEGRAM_USERNAME}?text=${encodeURIComponent(message)}`;
       document.getElementById("checkoutTelegramLink").href = tgLink;
@@ -763,10 +998,19 @@ ${lines}
       let ticketNumber = null;
       if(ORDERS_API_URL){
         try{
+          const headers = { "Content-Type": "application/json" };
+          if(window.ReyhoonAuth && window.ReyhoonAuth.getToken()){
+            headers["Authorization"] = "Bearer " + window.ReyhoonAuth.getToken();
+          }
           const res = await fetch(`${ORDERS_API_URL}/api/order`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name, phone, address, items: orderItems, total: cartTotal() }),
+            headers,
+            body: JSON.stringify({
+              name, phone, address, items: orderItems,
+              subtotal: cartTotal(),
+              discountCode: appliedDiscount ? appliedDiscount.code : undefined,
+              total: cartFinalTotal(),
+            }),
           });
           if(res.ok){
             const data = await res.json();
@@ -832,6 +1076,23 @@ ${lines}
   updateLiveIndicator();
   fetchLivePrice();
   fetchGallery();
+  syncFavorites();
   setInterval(fetchLivePrice, LIVE_REFRESH_MS);
   setInterval(fetchGallery, 30000);
+
+  // ---------- API مشترک برای صفحات دیگه (مثل favorites.html) ----------
+  window.ReyhoonShop = {
+    getProducts: () => PRODUCTS,
+    productPrice,
+    productVisual,
+    priceText,
+    addToCart,
+    openLightbox,
+    toggleFavorite,
+    isFavorite: (id) => favoriteIds.has(String(id)),
+    syncFavorites,
+    onGalleryLoaded: (cb) => { galleryLoadedCallbacks.push(cb); if(galleryLoaded) cb(PRODUCTS); },
+    isPriceReady: () => priceReady,
+    onPriceReady: (cb) => { if(priceReady) cb(); else priceReadyCallbacks.push(cb); },
+  };
 })();
