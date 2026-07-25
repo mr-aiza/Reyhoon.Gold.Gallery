@@ -1,1 +1,1 @@
-# Reyhoon.Gold.Gallery.V2
+# Reyhoon.Gold.Gallery
