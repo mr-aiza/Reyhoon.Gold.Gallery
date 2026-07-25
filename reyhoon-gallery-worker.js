@@ -6,12 +6,197 @@
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 const PAGE_SIZE = 5;
 
 const DEFAULT_SETTINGS = { fee18: 20, fee24: 4 };
+
+// تبدیل ارقام فارسی (۰-۹) و عربی (٠-٩) به انگلیسی، چون کیبورد فارسی موبایل پیش‌فرض
+// این ارقام رو می‌فرسته و parseFloat/parseInt انگلیسی نمی‌فهمتشون (NaN می‌ده و بی‌صدا رد می‌شه)
+function normalizeDigits(str) {
+  return String(str)
+    .replace(/[۰-۹]/g, (d) => "۰۱۲۳۴۵۶۷۸۹".indexOf(d))
+    .replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d))
+    .replace(/[,٬،]/g, "") // جداکننده هزارگان
+    .trim();
+}
+
+// آدرس سایت فروشگاه (برای ساخت لینک فاکتور که تو تلگرام فرستاده می‌شه) — اینو با دامنه واقعی سایتت جایگزین کن
+const SITE_URL = "https://reyhoongoldgallery.pages.dev";
+
+// ============================================================
+//  همکاران ادمین و قابلیت‌های دسترسی (تک‌تک، قابل فعال/غیرفعال‌سازی)
+// ============================================================
+const PERM_LABEL = {
+  orders: "🎫 سفارش‌ها و تیکت‌ها",
+  products: "✏️ افزودن/ویرایش محصول",
+  delete_product: "🗑 حذف محصول",
+  discounts: "🏷 کدهای تخفیف",
+  settings: "⚙️ تنظیمات اجرت",
+  stats: "📊 آمار فروشگاه",
+  backup: "💾 بک‌آپ",
+  manage_admins: "👥 مدیریت همکاران",
+};
+const PERM_ORDER = ["orders", "products", "delete_product", "discounts", "settings", "stats", "backup", "manage_admins"];
+const DEFAULT_NEW_PERMS = ["orders"]; // پیش‌فرض وقتی همکار جدید اضافه می‌شه
+
+// role می‌تونه یکی از این‌ها باشه: "owner" (رشته) | آرایه‌ای از perm ها | null (بدون دسترسی)
+function hasPerm(role, perm) {
+  if (!perm) return !!role; // فقط لازمه یه سطح دسترسی (هرچی) داشته باشه
+  if (role === "owner") return true;
+  if (!role) return false;
+  return role.includes(perm);
+}
+
+function permsLabel(perms) {
+  if (!perms || !perms.length) return "بدون قابلیت فعال";
+  return perms.map((p) => PERM_LABEL[p] || p).join("، ");
+}
+
+async function getCoAdmins(env) {
+  const raw = await env.SHOP_DB.get("co_admins");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveCoAdmins(list, env) {
+  await env.SHOP_DB.put("co_admins", JSON.stringify(list));
+}
+
+// تبدیل ساختار قدیمی (role تکی) به آرایه perms، برای همکارهایی که قبل از این آپدیت اضافه شدن
+function migrateOldRole(role) {
+  if (role === "products") return ["orders", "products"];
+  if (role === "full") return ["orders", "products", "discounts", "settings", "stats", "backup"];
+  return ["orders"]; // role === "orders" یا نامشخص
+}
+
+// خروجی: "owner" یا آرایه perms یا null
+async function getAdminRole(chatId, env) {
+  chatId = String(chatId);
+  if (chatId === String(env.ADMIN_ID)) return "owner";
+  const list = await getCoAdmins(env);
+  const found = list.find((a) => String(a.chatId) === chatId);
+  if (!found) return null;
+  if (found.perms) return found.perms;
+  return migrateOldRole(found.role); // هنوز فرمت قدیمی داره، تا وقتی از /addadmin دوباره ثبت بشه
+}
+
+// قابلیت لازم برای هر دکمه/اکشن پنل — null یعنی فقط داشتن هر نوع دسترسی کافیه (منو، لیست، تیکت‌ها، تایید/رد سفارش)
+function callbackRequiredPerm(data) {
+  if (data.startsWith("del:") || data.startsWith("delmenu:")) return "delete_product";
+  if (data === "admins" || data.startsWith("deladmin:") || data.startsWith("ap:") || data === "apconfirm" || data === "apcancel") return "manage_admins";
+  if (data === "settings" || data.startsWith("setfee:")) return "settings";
+  if (data === "discounts" || data === "newcode" || data.startsWith("disctype:") || data.startsWith("delcode:")) return "discounts";
+  if (data === "stats" || data === "favstats") return "stats";
+  if (data === "dobackup") return "backup";
+  if (
+    data === "newitem" || data === "newitem_cancel" || data === "newitem_confirm" || data === "newitem_like" ||
+    data === "newphoto_done" || data === "addhelp" ||
+    data.startsWith("addimg:") || data.startsWith("edit:") || data.startsWith("editf:") ||
+    data.startsWith("editimgs:") || data.startsWith("editmenu:") ||
+    data.startsWith("setcat:") || data.startsWith("setkarat:") || data.startsWith("setbadge:") || data.startsWith("setfeatured:") ||
+    data.startsWith("delimg:") || data.startsWith("newcat:") || data.startsWith("newkarat:") ||
+    data.startsWith("newbadge:") || data.startsWith("newfeatured:") || data.startsWith("newfee:")
+  ) {
+    return "products";
+  }
+  return null; // عمومی/ناوبری
+}
+
+function buildPermToggleKeyboard(targetId, perms) {
+  const rows = PERM_ORDER.map((p) => [{
+    text: (perms.includes(p) ? "✅ " : "☐ ") + PERM_LABEL[p],
+    callback_data: "ap:" + p,
+  }]);
+  rows.push([{ text: "✔️ تایید و افزودن همکار", callback_data: "apconfirm" }]);
+  rows.push([{ text: "انصراف", callback_data: "apcancel" }]);
+  return rows;
+}
+
+async function startAddAdminFlow(text, chatId, env) {
+  const parts = text.trim().split(/\s+/);
+  const targetId = parts[1];
+  if (!targetId || !/^\d+$/.test(targetId)) {
+    await sendMessage(
+      chatId,
+      "فرمت درست نیست. اینجوری بفرست:\n/addadmin <chat_id>\n\nمثال:\n/addadmin 123456789\n\nبعدش قابلیت‌هایی که می‌خوای براش فعال بشه رو تک‌تک از روی دکمه‌ها انتخاب می‌کنی.\n\n(همکارت باید اول تو همین ربات /whoami رو بزنه تا chat id خودش رو بگیره و بهت بده)",
+      env
+    );
+    return;
+  }
+  if (targetId === String(env.ADMIN_ID)) {
+    await sendMessage(chatId, "این آیدی خودته، نیازی به اضافه کردن نیست.", env);
+    return;
+  }
+  const list = await getCoAdmins(env);
+  const existing = list.find((a) => String(a.chatId) === targetId);
+  const perms = existing ? [...(existing.perms || migrateOldRole(existing.role))] : [...DEFAULT_NEW_PERMS];
+  await env.SHOP_DB.put("addadmindraft:" + chatId, JSON.stringify({ targetId, perms }));
+  await sendMessage(
+    chatId,
+    (existing ? "ویرایش قابلیت‌های همکار " : "قابلیت‌های همکار جدید ") + targetId + " رو انتخاب کن (با زدن هرکدوم فعال/غیرفعال می‌شه):",
+    env,
+    buildPermToggleKeyboard(targetId, perms)
+  );
+}
+
+async function handleAddAdminToggle(chatId, messageId, perm, env) {
+  const raw = await env.SHOP_DB.get("addadmindraft:" + chatId);
+  if (!raw) return;
+  const draft = JSON.parse(raw);
+  const idx = draft.perms.indexOf(perm);
+  if (idx >= 0) draft.perms.splice(idx, 1);
+  else draft.perms.push(perm);
+  await env.SHOP_DB.put("addadmindraft:" + chatId, JSON.stringify(draft));
+  await editMessage(
+    chatId, messageId,
+    "قابلیت‌های همکار " + draft.targetId + " رو انتخاب کن (با زدن هرکدوم فعال/غیرفعال می‌شه):",
+    env,
+    buildPermToggleKeyboard(draft.targetId, draft.perms)
+  );
+}
+
+async function handleAddAdminConfirm(chatId, messageId, env) {
+  const raw = await env.SHOP_DB.get("addadmindraft:" + chatId);
+  if (!raw) return;
+  const draft = JSON.parse(raw);
+  const list = await getCoAdmins(env);
+  const existing = list.find((a) => String(a.chatId) === draft.targetId);
+  if (existing) {
+    existing.perms = draft.perms;
+  } else {
+    list.push({ chatId: draft.targetId, perms: draft.perms, addedAt: Date.now() });
+  }
+  await saveCoAdmins(list, env);
+  await env.SHOP_DB.delete("addadmindraft:" + chatId);
+  await editMessage(
+    chatId, messageId,
+    "✅ همکار " + draft.targetId + " با این قابلیت‌ها ثبت شد:\n" + permsLabel(draft.perms),
+    env,
+    [[{ text: "👥 لیست همکاران", callback_data: "admins" }]]
+  );
+  try {
+    await sendMessage(
+      draft.targetId,
+      "سلام! دسترسی مدیریت به فروشگاه ریحون گلد گالری برات فعال شد.\nقابلیت‌های فعال: " + permsLabel(draft.perms) + "\n\nبرای شروع /start رو بزن.",
+      env
+    );
+  } catch (err) {
+    // اگه همکار هنوز به ربات پیام نداده باشه، ارسال بهش خطا می‌ده؛ مهم نیست، خودش /start رو می‌زنه
+  }
+}
+
+async function sendAdminList(chatId, messageId, env) {
+  const list = await getCoAdmins(env);
+  const rows = list.map((a) => [{ text: "🗑 " + a.chatId + " — " + permsLabel(a.perms || migrateOldRole(a.role)), callback_data: "deladmin:" + a.chatId }]);
+  rows.push([{ text: "« بازگشت", callback_data: "menu" }]);
+  const text = list.length
+    ? "👥 همکاران فعلی:\nبرای حذف روی هرکدوم بزن.\n\nبرای افزودن همکار جدید یا ویرایش قابلیت‌ها:\n/addadmin <chat_id>"
+    : "هنوز همکاری اضافه نکردی.\n\nبرای افزودن:\n/addadmin <chat_id>\n\n(همکارت اول باید تو ربات /whoami رو بزنه تا chat id خودش رو بگیره)";
+  if (messageId) await editMessage(chatId, messageId, text, env, rows);
+  else await sendMessage(chatId, text, env, rows);
+}
 
 // ------------------------------------------------------------
 //  Router
@@ -31,6 +216,41 @@ export default {
     // ---- سفارش‌ها (قبلاً وورکر جدا reyhoon-orders، الان ادغام شده اینجا) ----
     if (url.pathname === "/api/order" && request.method === "POST") {
       return handleNewOrder(request, env);
+    }
+
+    // ---- احراز هویت کاربران (شماره تماس + رمز عبور) ----
+    if (url.pathname === "/api/auth/register" && request.method === "POST") {
+      return handleAuthRegister(request, env);
+    }
+    if (url.pathname === "/api/auth/login" && request.method === "POST") {
+      return handleAuthLogin(request, env);
+    }
+    if (url.pathname === "/api/auth/me" && request.method === "GET") {
+      return handleAuthMe(request, env);
+    }
+    if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+      return handleAuthLogout(request, env);
+    }
+
+    // ---- پیگیری سفارش‌های کاربر لاگین‌کرده ----
+    if (url.pathname === "/api/orders/mine" && request.method === "GET") {
+      return handleMyOrders(request, env);
+    }
+
+    // ---- فاکتور سفارش تاییدشده ----
+    if (url.pathname === "/api/invoice" && request.method === "GET") {
+      return handleInvoiceData(request, env);
+    }
+
+    // ---- کدهای تخفیف ----
+    if (url.pathname === "/api/discount/check" && request.method === "POST") {
+      return handleDiscountCheck(request, env);
+    }
+    if (url.pathname === "/api/favorites/toggle" && request.method === "POST") {
+      return handleFavoriteToggle(request, env);
+    }
+    if (url.pathname === "/api/favorites/mine" && request.method === "GET") {
+      return handleMyFavorites(request, env);
     }
 
     if (url.pathname === "/telegram-webhook" && request.method === "POST") {
@@ -100,6 +320,113 @@ function jsonResponse(obj, status) {
   });
 }
 
+// ============================================================
+//  احراز هویت کاربران (شماره تماس + رمز عبور)
+//  رمزها هرگز خام ذخیره نمی‌شن؛ فقط هش (SHA-256 + نمک تصادفی) در KV ذخیره می‌شه.
+// ============================================================
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // ۳۰ روز
+
+function generateRandomToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  return arrayBufferToBase64(bytes.buffer).replace(/[^a-zA-Z0-9]/g, "");
+}
+
+async function hashPassword(password, salt) {
+  const enc = new TextEncoder();
+  const data = enc.encode(salt + ":" + password);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return arrayBufferToBase64(hashBuffer);
+}
+
+async function createSession(phone, env) {
+  const token = generateRandomToken();
+  await env.SHOP_DB.put("session:" + token, phone, { expirationTtl: SESSION_TTL_SECONDS });
+  return token;
+}
+
+async function getUserFromRequest(request, env) {
+  const authHeader = request.headers.get("Authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+  if (!token) return null;
+  const phone = await env.SHOP_DB.get("session:" + token);
+  if (!phone) return null;
+  const raw = await env.SHOP_DB.get("user:" + phone);
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+function publicUser(user) {
+  return { phone: user.phone, name: user.name || null };
+}
+
+async function handleAuthRegister(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "بدنه درخواست نامعتبره." }, 400);
+  }
+  const phone = String(body.phone || "").trim();
+  const password = String(body.password || "");
+  const name = String(body.name || "").trim();
+
+  if (!/^09\d{9}$/.test(phone)) {
+    return jsonResponse({ error: "شماره تماس معتبر نیست (باید مثل 09xxxxxxxxx باشه)." }, 400);
+  }
+  if (password.length < 4) {
+    return jsonResponse({ error: "رمز عبور باید حداقل ۴ کاراکتر باشه." }, 400);
+  }
+
+  const existing = await env.SHOP_DB.get("user:" + phone);
+  if (existing) {
+    return jsonResponse({ error: "این شماره قبلاً ثبت‌نام شده. وارد شو." }, 409);
+  }
+
+  const salt = generateRandomToken();
+  const passwordHash = await hashPassword(password, salt);
+  const user = { phone, name: name || null, passwordHash, salt, createdAt: Date.now() };
+  await env.SHOP_DB.put("user:" + phone, JSON.stringify(user));
+
+  const token = await createSession(phone, env);
+  return jsonResponse({ token, ...publicUser(user) });
+}
+
+async function handleAuthLogin(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "بدنه درخواست نامعتبره." }, 400);
+  }
+  const phone = String(body.phone || "").trim();
+  const password = String(body.password || "");
+
+  const raw = await env.SHOP_DB.get("user:" + phone);
+  if (!raw) return jsonResponse({ error: "شماره تماس یا رمز عبور اشتباهه." }, 401);
+
+  const user = JSON.parse(raw);
+  const hash = await hashPassword(password, user.salt);
+  if (hash !== user.passwordHash) {
+    return jsonResponse({ error: "شماره تماس یا رمز عبور اشتباهه." }, 401);
+  }
+
+  const token = await createSession(phone, env);
+  return jsonResponse({ token, ...publicUser(user) });
+}
+
+async function handleAuthMe(request, env) {
+  const user = await getUserFromRequest(request, env);
+  if (!user) return jsonResponse({ error: "وارد نشدی." }, 401);
+  return jsonResponse(publicUser(user));
+}
+
+async function handleAuthLogout(request, env) {
+  const authHeader = request.headers.get("Authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+  if (token) await env.SHOP_DB.delete("session:" + token);
+  return jsonResponse({ ok: true });
+}
+
 async function handleNewOrder(request, env) {
   let body;
   try {
@@ -112,13 +439,32 @@ async function handleNewOrder(request, env) {
   const phone = String(body.phone || "").trim();
   const address = String(body.address || "").trim();
   const items = Array.isArray(body.items) ? body.items : [];
-  const total = Number(body.total) || 0;
+  const subtotal = Number(body.subtotal) || Number(body.total) || 0;
+  const discountCodeRaw = String(body.discountCode || "").trim().toUpperCase();
+
+  let total = subtotal;
+  let discountInfo = null;
+
+  if (discountCodeRaw) {
+    const discount = await getDiscount(discountCodeRaw, env);
+    if (discount && discount.active) {
+      const discountAmount = computeDiscountAmount(discount, subtotal);
+      total = Math.max(0, subtotal - discountAmount);
+      discountInfo = { code: discount.code, type: discount.type, value: discount.value, discountAmount };
+      discount.usageCount = (discount.usageCount || 0) + 1;
+      await saveDiscount(discount, env);
+    }
+  }
 
   if (!name || !phone || !address || items.length === 0) {
     return jsonResponse({ ok: false, error: "missing fields" }, 400);
   }
 
+  // اگه کاربر لاگین باشه، سفارش به حسابش وصل می‌شه (برای پیگیری بعدی)
+  const account = await getUserFromRequest(request, env);
+
   const ticketNumber = await getNextTicket(env);
+  const invoiceToken = crypto.randomUUID().replace(/-/g, "");
 
   const order = {
     ticketNumber: ticketNumber,
@@ -126,12 +472,24 @@ async function handleNewOrder(request, env) {
     phone: phone,
     address: address,
     items: items,
+    subtotal: subtotal,
+    discount: discountInfo,
     total: total,
     status: "pending",
+    accountPhone: account ? account.phone : null,
+    invoiceToken: invoiceToken,
     createdAt: Date.now(),
   };
 
   await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
+
+  if (account) {
+    try {
+      await addOrderToUserIndex(account.phone, ticketNumber, env);
+    } catch (err) {
+      // ایندکس نشدن سفارش نباید ثبت سفارش رو خراب کنه
+    }
+  }
 
   // ---- کم کردن موجودی انبار بر اساس محصولات سفارش‌داده‌شده ----
   try {
@@ -145,16 +503,20 @@ async function handleNewOrder(request, env) {
     return "- " + it.name + " (" + karatText + "، " + it.weight + " گرم) x" + it.qty + " = " + toToman(it.unitPrice * it.qty) + " تومان";
   }).join("\n");
 
+  const discountLine = discountInfo
+    ? "\n\nکد تخفیف: " + discountInfo.code + " (" + toToman(discountInfo.discountAmount) + " تومان)\nجمع قبل از تخفیف: " + toToman(subtotal) + " تومان"
+    : "";
+
   const message =
     "تیکت سفارش جدید #" + ticketNumber + "\n\n" +
     "نام: " + name + "\n" +
     "تماس: " + phone + "\n" +
     "آدرس: " + address + "\n\n" +
-    "اقلام:\n" + itemLines + "\n\n" +
+    "اقلام:\n" + itemLines + discountLine + "\n\n" +
     "جمع کل: " + toToman(total) + " تومان";
 
   try {
-    await sendMessage(env.ADMIN_ID, message, env, [
+    await notifyAdmins(env, "orders", message, [
       [{ text: "✅ تایید سفارش", callback_data: "apporder:" + ticketNumber }, { text: "❌ رد سفارش", callback_data: "rejorder:" + ticketNumber }],
     ]);
   } catch (err) {
@@ -207,6 +569,279 @@ async function getNextTicket(env) {
   return next;
 }
 
+// ============================================================
+//  پیگیری سفارش بر اساس حساب کاربری (شماره تماس لاگین‌شده)
+// ============================================================
+async function addOrderToUserIndex(phone, ticketNumber, env) {
+  const raw = await env.SHOP_DB.get("orders_by_phone:" + phone);
+  const list = raw ? JSON.parse(raw) : [];
+  if (!list.includes(ticketNumber)) list.unshift(ticketNumber);
+  await env.SHOP_DB.put("orders_by_phone:" + phone, JSON.stringify(list));
+}
+
+async function handleMyOrders(request, env) {
+  const user = await getUserFromRequest(request, env);
+  if (!user) return jsonResponse({ error: "برای دیدن سفارش‌هات باید وارد حساب بشی." }, 401);
+
+  const raw = await env.SHOP_DB.get("orders_by_phone:" + user.phone);
+  const ticketNumbers = raw ? JSON.parse(raw) : [];
+
+  const orders = [];
+  for (const tn of ticketNumbers) {
+    const orderRaw = await env.SHOP_DB.get("order:" + tn);
+    if (orderRaw) orders.push(JSON.parse(orderRaw));
+  }
+  orders.sort((a, b) => b.createdAt - a.createdAt);
+
+  return jsonResponse({ orders });
+}
+
+// ============================================================
+//  کدهای تخفیف
+// ============================================================
+async function getDiscountCodes(env) {
+  const raw = await env.SHOP_DB.get("discount_codes");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveDiscountCodesIndex(list, env) {
+  await env.SHOP_DB.put("discount_codes", JSON.stringify(list));
+}
+
+async function getDiscount(code, env) {
+  const raw = await env.SHOP_DB.get("discount:" + String(code).toUpperCase());
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function saveDiscount(discount, env) {
+  await env.SHOP_DB.put("discount:" + discount.code, JSON.stringify(discount));
+  const index = await getDiscountCodes(env);
+  if (!index.includes(discount.code)) {
+    index.push(discount.code);
+    await saveDiscountCodesIndex(index, env);
+  }
+}
+
+async function deleteDiscount(code, env) {
+  code = String(code).toUpperCase();
+  await env.SHOP_DB.delete("discount:" + code);
+  const index = await getDiscountCodes(env);
+  await saveDiscountCodesIndex(index.filter((c) => c !== code), env);
+}
+
+function computeDiscountAmount(discount, subtotal) {
+  if (discount.type === "percent") return Math.round((subtotal * discount.value) / 100);
+  return Math.min(discount.value, subtotal);
+}
+
+function discountLabel(discount) {
+  return discount.type === "percent" ? discount.value + "% تخفیف" : toToman(discount.value) + " تومان تخفیف";
+}
+
+async function handleDiscountCheck(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ valid: false, error: "بدنه درخواست نامعتبره." }, 400);
+  }
+  const code = String(body.code || "").trim().toUpperCase();
+  const subtotal = Number(body.subtotal) || 0;
+  if (!code) return jsonResponse({ valid: false, error: "کد رو وارد کن." });
+
+  const discount = await getDiscount(code, env);
+  if (!discount || !discount.active) {
+    return jsonResponse({ valid: false, error: "کد تخفیف معتبر نیست." });
+  }
+
+  const discountAmount = computeDiscountAmount(discount, subtotal);
+  return jsonResponse({
+    valid: true,
+    code: discount.code,
+    type: discount.type,
+    value: discount.value,
+    discountAmount,
+    label: discountLabel(discount),
+  });
+}
+
+// ------------------------------------------------------------
+//  ساخت/حذف کد تخفیف از پنل تلگرام (پیش‌نویس موقت شبیه‌سازی محصول)
+// ------------------------------------------------------------
+async function getDiscDraft(chatId, env) {
+  const raw = await env.SHOP_DB.get("discdraft:" + chatId);
+  return raw ? JSON.parse(raw) : {};
+}
+
+async function saveDiscDraft(chatId, patch, env) {
+  const draft = await getDiscDraft(chatId, env);
+  Object.assign(draft, patch);
+  await env.SHOP_DB.put("discdraft:" + chatId, JSON.stringify(draft));
+  return draft;
+}
+
+async function clearDiscDraft(chatId, env) {
+  await env.SHOP_DB.delete("discdraft:" + chatId);
+}
+
+async function buildDiscountListKeyboard(env) {
+  const codes = await getDiscountCodes(env);
+  const rows = [];
+  for (const code of codes) {
+    const d = await getDiscount(code, env);
+    if (!d) continue;
+    const usageNote = d.usageCount ? " (" + d.usageCount + " بار استفاده)" : "";
+    rows.push([{ text: "🗑 " + d.code + " — " + discountLabel(d) + usageNote, callback_data: "delcode:" + d.code }]);
+  }
+  rows.push([{ text: "➕ کد تخفیف جدید", callback_data: "newcode" }]);
+  rows.push([{ text: "« بازگشت", callback_data: "menu" }]);
+  return rows;
+}
+
+async function sendDiscountList(chatId, messageId, env) {
+  const codes = await getDiscountCodes(env);
+  const text = codes.length ? "🏷 کدهای تخفیف\nبرای حذف یه کد، روش بزن." : "🏷 کدهای تخفیف\nهنوز کد تخفیفی نساختی.";
+  const kb = await buildDiscountListKeyboard(env);
+  if (messageId) await editMessage(chatId, messageId, text, env, kb);
+  else await sendMessage(chatId, text, env, kb);
+}
+
+
+async function getUserFavorites(phone, env) {
+  const raw = await env.SHOP_DB.get("favorites:" + phone);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveUserFavorites(phone, list, env) {
+  await env.SHOP_DB.put("favorites:" + phone, JSON.stringify(list));
+}
+
+async function getFavCounts(env) {
+  const raw = await env.SHOP_DB.get("fav_counts");
+  return raw ? JSON.parse(raw) : {};
+}
+
+async function saveFavCounts(counts, env) {
+  await env.SHOP_DB.put("fav_counts", JSON.stringify(counts));
+}
+
+async function getFavUsers(env) {
+  const raw = await env.SHOP_DB.get("fav_users");
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveFavUsers(list, env) {
+  await env.SHOP_DB.put("fav_users", JSON.stringify(list));
+}
+
+async function handleFavoriteToggle(request, env) {
+  const user = await getUserFromRequest(request, env);
+  if (!user) return jsonResponse({ error: "برای علاقه‌مندی باید وارد حساب بشی." }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "بدنه درخواست نامعتبره." }, 400);
+  }
+  const itemId = String(body.itemId || "").trim();
+  if (!itemId) return jsonResponse({ error: "itemId الزامیه." }, 400);
+
+  const list = await getUserFavorites(user.phone, env);
+  const idx = list.indexOf(itemId);
+  const counts = await getFavCounts(env);
+  let favorited;
+
+  if (idx >= 0) {
+    list.splice(idx, 1);
+    counts[itemId] = Math.max(0, (counts[itemId] || 0) - 1);
+    favorited = false;
+  } else {
+    list.push(itemId);
+    counts[itemId] = (counts[itemId] || 0) + 1;
+    favorited = true;
+  }
+
+  await saveUserFavorites(user.phone, list, env);
+  await saveFavCounts(counts, env);
+
+  const favUsers = await getFavUsers(env);
+  const alreadyTracked = favUsers.includes(user.phone);
+  if (list.length > 0 && !alreadyTracked) {
+    favUsers.push(user.phone);
+    await saveFavUsers(favUsers, env);
+  } else if (list.length === 0 && alreadyTracked) {
+    await saveFavUsers(favUsers.filter((p) => p !== user.phone), env);
+  }
+
+  return jsonResponse({ favorited, favorites: list });
+}
+
+async function handleMyFavorites(request, env) {
+  const user = await getUserFromRequest(request, env);
+  if (!user) return jsonResponse({ error: "برای دیدن علاقه‌مندی‌هات باید وارد حساب بشی." }, 401);
+
+  const list = await getUserFavorites(user.phone, env);
+  const items = await getItems(env);
+  const favItems = items.filter((it) => list.includes(String(it.id)));
+
+  return jsonResponse({ itemIds: list, items: favItems });
+}
+
+async function buildFavStatsText(env) {
+  const counts = await getFavCounts(env);
+  const favUsers = await getFavUsers(env);
+  const items = await getItems(env);
+  const byId = {};
+  items.forEach((it) => { byId[String(it.id)] = it; });
+
+  const entries = Object.entries(counts).filter(([, c]) => c > 0);
+  entries.sort((a, b) => b[1] - a[1]);
+
+  let text = "❤️ پرطرفدارترین‌ها\n\n";
+  text += "تعداد کاربرانی که علاقه‌مندی دارن: " + favUsers.length + "\n\n";
+  if (entries.length === 0) {
+    text += "هنوز کسی چیزی رو لایک نکرده.";
+    return text;
+  }
+  text += "پرطرفدارترین محصولات:\n";
+  entries.slice(0, 15).forEach(([id, count], i) => {
+    const it = byId[id];
+    const name = it ? it.name : "(محصول حذف‌شده #" + id + ")";
+    text += (i + 1) + ". " + name + " — " + count + " ❤️\n";
+  });
+
+  return text;
+}
+
+// ============================================================
+//  فاکتور سفارش
+// ============================================================
+async function handleInvoiceData(request, env) {
+  const url = new URL(request.url);
+  const ticketNumber = url.searchParams.get("ticket");
+  const token = url.searchParams.get("token");
+  if (!ticketNumber) return jsonResponse({ error: "شماره سفارش لازمه." }, 400);
+
+  const raw = await env.SHOP_DB.get("order:" + ticketNumber);
+  if (!raw) return jsonResponse({ error: "سفارش پیدا نشد." }, 404);
+  const order = JSON.parse(raw);
+
+  if (order.status !== "approved") {
+    return jsonResponse({ error: "فاکتور فقط بعد از تایید سفارش صادر می‌شه." }, 403);
+  }
+
+  let authorized = false;
+  if (token && order.invoiceToken && token === order.invoiceToken) authorized = true;
+  if (!authorized) {
+    const user = await getUserFromRequest(request, env);
+    if (user && order.accountPhone && user.phone === order.accountPhone) authorized = true;
+  }
+  if (!authorized) return jsonResponse({ error: "دسترسی نداری." }, 401);
+
+  return jsonResponse({ order });
+}
+
 async function handleOrderDecision(data, chatId, messageId, env) {
   const parts = data.split(":");
   const approve = parts[0] === "apporder";
@@ -228,8 +863,10 @@ async function handleOrderDecision(data, chatId, messageId, env) {
   if (approve) {
     order.status = "approved";
     await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
+    const invoiceUrl = SITE_URL + "/invoice.html?ticket=" + ticketNumber + "&token=" + order.invoiceToken;
     await editMessage(chatId, messageId,
-      "✅ سفارش #" + ticketNumber + " تایید شد.\nموجودی انبار همون‌طوری که کم شده بود می‌مونه.", env);
+      "✅ سفارش #" + ticketNumber + " تایید شد.\nموجودی انبار همون‌طوری که کم شده بود می‌مونه.", env,
+      [[{ text: "🧾 مشاهده / دانلود فاکتور", url: invoiceUrl }]]);
   } else {
     order.status = "rejected";
     await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
@@ -345,6 +982,22 @@ function answerCallback(callbackQueryId, env, text) {
   return tgApi("answerCallbackQuery", payload, env);
 }
 
+// ارسال پیام به مالک + هر همکاری که سطح دسترسیش کافیه (برای سفارش/تیکت جدید)
+async function notifyAdmins(env, perm, text, keyboard) {
+  const recipients = [String(env.ADMIN_ID)];
+  const coAdmins = await getCoAdmins(env);
+  for (const a of coAdmins) {
+    if (hasPerm(a.perms || migrateOldRole(a.role), perm)) recipients.push(String(a.chatId));
+  }
+  for (const chatId of recipients) {
+    try {
+      await sendMessage(chatId, text, env, keyboard);
+    } catch (err) {
+      // اگه ارسال به یکی از همکارها خطا بده (مثلاً ربات رو بلاک کرده)، بقیه رو متوقف نکن
+    }
+  }
+}
+
 // ============================================================
 //  Webhook entrypoint
 // ============================================================
@@ -366,12 +1019,13 @@ async function handleTelegramWebhook(request, env) {
     return new Response("ok");
   }
 
-  if (chatId !== String(env.ADMIN_ID)) {
+  const role = await getAdminRole(chatId, env);
+  if (!role) {
     return new Response("ok");
   }
 
   try {
-    await handleAdminMessage(msg, chatId, env);
+    await handleAdminMessage(msg, chatId, env, role);
   } catch (err) {
     await sendMessage(chatId, "خطا: " + err.message, env);
   }
@@ -382,7 +1036,7 @@ async function handleTelegramWebhook(request, env) {
 // ============================================================
 //  Admin message handling (متن‌های ادمین + state دوطرفه)
 // ============================================================
-async function handleAdminMessage(msg, chatId, env) {
+async function handleAdminMessage(msg, chatId, env, role) {
   const state = await env.SHOP_DB.get("state:" + chatId);
   if (state) {
     const consumed = await handlePendingState(state, msg, chatId, env);
@@ -390,12 +1044,16 @@ async function handleAdminMessage(msg, chatId, env) {
   }
 
   if (msg.photo && msg.caption) {
+    if (!hasPerm(role, "products")) {
+      await sendMessage(chatId, "⛔️ برای افزودن محصول دسترسی لازم رو نداری.", env);
+      return;
+    }
     await handleNewItem(msg, env);
     return;
   }
 
   if (msg.text === "/start" || msg.text === "/panel") {
-    await sendDashboard(chatId, env);
+    await sendDashboard(chatId, env, role);
     return;
   }
 
@@ -410,6 +1068,10 @@ async function handleAdminMessage(msg, chatId, env) {
   }
 
   if (msg.text && msg.text.startsWith("/delete")) {
+    if (!hasPerm(role, "delete_product")) {
+      await sendMessage(chatId, "⛔️ برای حذف محصول دسترسی لازم رو نداری.", env);
+      return;
+    }
     await handleDeleteCommand(msg.text, chatId, env);
     return;
   }
@@ -420,8 +1082,30 @@ async function handleAdminMessage(msg, chatId, env) {
   }
 
   if (msg.text === "/backup") {
+    if (!hasPerm(role, "backup")) {
+      await sendMessage(chatId, "⛔️ دسترسی لازم برای این کار رو نداری.", env);
+      return;
+    }
     await sendMessage(chatId, "در حال تهیه بک‌آپ...", env);
     await runBackup(env, "دستی");
+    return;
+  }
+
+  if (msg.text && msg.text.startsWith("/addadmin")) {
+    if (!hasPerm(role, "manage_admins")) {
+      await sendMessage(chatId, "⛔️ دسترسی مدیریت همکاران رو نداری.", env);
+      return;
+    }
+    await startAddAdminFlow(msg.text, chatId, env);
+    return;
+  }
+
+  if (msg.text === "/admins") {
+    if (!hasPerm(role, "manage_admins")) {
+      await sendMessage(chatId, "⛔️ دسترسی مدیریت همکاران رو نداری.", env);
+      return;
+    }
+    await sendAdminList(chatId, null, env);
     return;
   }
 
@@ -429,13 +1113,53 @@ async function handleAdminMessage(msg, chatId, env) {
 }
 
 async function handlePendingState(state, msg, chatId, env) {
-  // مرحله عکس: تنها استثنایی که پیام متنی نیست
+  // مرحله عکس: تنها استثنایی که پیام متنی نیست. می‌تونه چند عکس پشت‌سرهم بگیره.
   if (state === "new_photo") {
     if (!msg.photo) {
       await sendMessage(chatId, "لطفاً یه عکس بفرست، یا /start رو بزن برای انصراف.", env);
       return true;
     }
-    await goToPreview(msg, chatId, env);
+    const photo = msg.photo[msg.photo.length - 1];
+    const draft = await saveDraft(chatId, {}, env);
+    const photoFileIds = draft.photoFileIds || [];
+    photoFileIds.push(photo.file_id);
+    await saveDraft(chatId, { photoFileIds }, env);
+    await sendMessage(
+      chatId,
+      "عکس " + photoFileIds.length + " ذخیره شد ✅\nمیخوای عکس دیگه‌ای هم برای این محصول اضافه کنی؟ (بفرست) یا ادامه بدیم؟",
+      env,
+      [[{ text: "✅ همینا کافیه، ادامه بده", callback_data: "newphoto_done" }]]
+    );
+    return true;
+  }
+
+  // افزودن عکس به یک محصول موجود (از منوی ویرایش)
+  if (state.startsWith("addimg:")) {
+    const id = parseInt(state.split(":")[1], 10);
+    if (!msg.photo) {
+      await sendMessage(chatId, "لطفاً یه عکس بفرست، یا دکمه پایین رو بزن.", env, [[{ text: "✅ تمام، بازگشت", callback_data: "edit:" + id }]]);
+      return true;
+    }
+    const items = await getItems(env);
+    const item = items.find((it) => it.id === id);
+    if (!item) {
+      await env.SHOP_DB.delete("state:" + chatId);
+      await sendMessage(chatId, "محصول پیدا نشد.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
+      return true;
+    }
+    const photo = msg.photo[msg.photo.length - 1];
+    const dataUrl = await downloadPhotoAsDataUrl(photo.file_id, env);
+    const images = getItemImages(item);
+    images.push(dataUrl);
+    item.images = images;
+    item.image = images[0];
+    await saveItems(items, env);
+    await sendMessage(
+      chatId,
+      "عکس افزوده شد ✅ (اکنون " + images.length + " عکس)\nمیخوای عکس دیگه‌ای هم بفرستی؟",
+      env,
+      [[{ text: "✅ تمام، بازگشت", callback_data: "edit:" + id }]]
+    );
     return true;
   }
 
@@ -464,7 +1188,7 @@ async function handlePendingState(state, msg, chatId, env) {
   }
 
   if (state === "new_weight") {
-    const val = parseFloat(msg.text);
+    const val = parseFloat(normalizeDigits(msg.text));
     if (isNaN(val)) {
       await sendMessage(chatId, "عدد نامعتبره. وزن رو به گرم بفرست (مثلاً 4.2):", env, cancelKeyboard());
       return true;
@@ -498,7 +1222,7 @@ async function handlePendingState(state, msg, chatId, env) {
   }
 
   if (state === "new_fee_manual") {
-    const val = parseFloat(msg.text);
+    const val = parseFloat(normalizeDigits(msg.text));
     if (isNaN(val)) {
       await sendMessage(chatId, "عدد نامعتبره. درصد اجرت رو بفرست:", env, cancelKeyboard());
       return true;
@@ -516,7 +1240,7 @@ async function handlePendingState(state, msg, chatId, env) {
   if (state.startsWith("await_fee_")) {
     await env.SHOP_DB.delete("state:" + chatId);
     const key = state.replace("await_fee_", "");
-    const val = parseFloat(msg.text);
+    const val = parseFloat(normalizeDigits(msg.text));
     if (isNaN(val)) {
       await sendMessage(chatId, "عدد نامعتبره. دوباره از منوی تنظیمات تلاش کن.", env, [[{ text: "⚙️ تنظیمات اجرت", callback_data: "settings" }]]);
       return true;
@@ -534,6 +1258,54 @@ async function handlePendingState(state, msg, chatId, env) {
     const ticketId = state.replace("await_reply_", "");
     await addTicketMessage(ticketId, "admin", msg.text, env);
     await sendMessage(chatId, "پاسخ برای تیکت #" + ticketId + " ارسال شد ✅", env, [[{ text: "🎫 تیکت‌های باز", callback_data: "tickets:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
+    return true;
+  }
+
+  if (state === "disc_code") {
+    const raw = msg.text.trim().toUpperCase().replace(/\s+/g, "");
+    if (!/^[A-Z0-9_-]{3,20}$/.test(raw)) {
+      await sendMessage(chatId, "کد نامعتبره. یه کد کوتاه انگلیسی/عددی بفرست (۳ تا ۲۰ کاراکتر، بدون فاصله؛ مثلاً WELCOME10):", env, [[{ text: "انصراف", callback_data: "menu" }]]);
+      return true;
+    }
+    const existing = await getDiscount(raw, env);
+    if (existing) {
+      await sendMessage(chatId, "این کد قبلاً ساخته شده. یه کد دیگه بفرست:", env, [[{ text: "انصراف", callback_data: "menu" }]]);
+      return true;
+    }
+    await saveDiscDraft(chatId, { code: raw }, env);
+    await env.SHOP_DB.put("state:" + chatId, "disc_type_wait");
+    await sendMessage(chatId, "نوع تخفیف کد «" + raw + "» چیه؟", env, [
+      [{ text: "درصدی (%)", callback_data: "disctype:percent" }, { text: "مبلغ ثابت (تومان)", callback_data: "disctype:fixed" }],
+      [{ text: "انصراف", callback_data: "menu" }],
+    ]);
+    return true;
+  }
+
+  if (state === "disc_type_wait") {
+    await sendMessage(chatId, "لطفاً از دکمه‌های بالا یکی رو انتخاب کن.", env);
+    return true;
+  }
+
+  if (state === "disc_value") {
+    const draft = await getDiscDraft(chatId, env);
+    const val = parseFloat(normalizeDigits(msg.text));
+    const invalid = isNaN(val) || val <= 0 || (draft.type === "percent" && val > 100);
+    if (invalid) {
+      await sendMessage(
+        chatId,
+        draft.type === "percent" ? "عدد نامعتبره. درصد رو بین ۱ تا ۱۰۰ بفرست:" : "عدد نامعتبره. مبلغ رو به تومان بفرست (مثلاً 50000):",
+        env,
+        [[{ text: "انصراف", callback_data: "menu" }]]
+      );
+      return true;
+    }
+    const discount = { code: draft.code, type: draft.type, value: val, active: true, usageCount: 0, createdAt: Date.now() };
+    await saveDiscount(discount, env);
+    await clearDiscDraft(chatId, env);
+    await env.SHOP_DB.delete("state:" + chatId);
+    await sendMessage(chatId, "کد تخفیف «" + draft.code + "» با " + discountLabel(discount) + " ساخته شد ✅", env, [
+      [{ text: "🏷 لیست کدها", callback_data: "discounts" }, { text: "🏠 منو", callback_data: "menu" }],
+    ]);
     return true;
   }
 
@@ -618,14 +1390,13 @@ function draftSummaryText(draft) {
     "موجودی: " + draft.stock + " عدد\n" +
     "اجرت: " + feeTxt + "\n" +
     "برچسب: " + (draft.badge || "—") + "\n" +
-    "نمایش در صفحه اصلی: " + (draft.featured ? "بله ✅" : "خیر") + "\n\n" +
+    "نمایش در صفحه اصلی: " + (draft.featured ? "بله ✅" : "خیر") + "\n" +
+    "عکس‌ها: " + ((draft.photoFileIds && draft.photoFileIds.length) || 0) + " عکس\n\n" +
     "همه چیز درسته؟"
   );
 }
 
-async function goToPreview(msg, chatId, env) {
-  const photo = msg.photo[msg.photo.length - 1];
-  await saveDraft(chatId, { photoFileId: photo.file_id }, env);
+async function goToPreview(chatId, env) {
   const draft = await getDraft(chatId, env);
   await env.SHOP_DB.put("state:" + chatId, "new_confirm");
   await sendMessage(chatId, draftSummaryText(draft), env, [
@@ -636,7 +1407,11 @@ async function goToPreview(msg, chatId, env) {
 
 async function finalizeNewItem(chatId, env) {
   const draft = await getDraft(chatId, env);
-  const imageDataUrl = await downloadPhotoAsDataUrl(draft.photoFileId, env);
+  const photoFileIds = draft.photoFileIds && draft.photoFileIds.length ? draft.photoFileIds : (draft.photoFileId ? [draft.photoFileId] : []);
+  const images = [];
+  for (const fileId of photoFileIds) {
+    images.push(await downloadPhotoAsDataUrl(fileId, env));
+  }
 
   const items = await getItems(env);
   const settings = await getSettings(env);
@@ -657,7 +1432,8 @@ async function finalizeNewItem(chatId, env) {
     badge: draft.badge || null,
     featured: !!draft.featured,
     rating: 4.7,
-    image: imageDataUrl,
+    images: images,
+    image: images[0] || null,
     createdAt: Date.now(),
   };
 
@@ -681,12 +1457,19 @@ async function handleCallbackQuery(cq, env) {
   const messageId = cq.message.message_id;
   const data = cq.data || "";
 
-  if (chatId !== String(env.ADMIN_ID)) {
+  const role = await getAdminRole(chatId, env);
+  if (!role) {
     await answerCallback(cq.id, env);
     return;
   }
 
   await answerCallback(cq.id, env);
+
+  const required = callbackRequiredPerm(data);
+  if (!hasPerm(role, required)) {
+    await editMessage(chatId, messageId, "⛔️ دسترسی لازم برای این کار رو نداری.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
+    return;
+  }
 
   if (data.startsWith("apporder:") || data.startsWith("rejorder:")) {
     await handleOrderDecision(data, chatId, messageId, env);
@@ -701,7 +1484,36 @@ async function handleCallbackQuery(cq, env) {
   }
 
   if (data === "menu") {
-    await editMessage(chatId, messageId, DASHBOARD_TEXT, env, dashboardKeyboard());
+    await editMessage(chatId, messageId, DASHBOARD_TEXT, env, dashboardKeyboard(role));
+    return;
+  }
+
+  if (data === "admins") {
+    await sendAdminList(chatId, messageId, env);
+    return;
+  }
+
+  if (data.startsWith("deladmin:")) {
+    const targetId = data.slice("deladmin:".length);
+    const list = await getCoAdmins(env);
+    await saveCoAdmins(list.filter((a) => String(a.chatId) !== targetId), env);
+    await sendAdminList(chatId, messageId, env);
+    return;
+  }
+
+  if (data.startsWith("ap:")) {
+    await handleAddAdminToggle(chatId, messageId, data.slice("ap:".length), env);
+    return;
+  }
+
+  if (data === "apconfirm") {
+    await handleAddAdminConfirm(chatId, messageId, env);
+    return;
+  }
+
+  if (data === "apcancel") {
+    await env.SHOP_DB.delete("addadmindraft:" + chatId);
+    await sendAdminList(chatId, messageId, env);
     return;
   }
 
@@ -848,6 +1660,50 @@ async function handleCallbackQuery(cq, env) {
     return;
   }
 
+  if (data === "newphoto_done") {
+    await goToPreview(chatId, env);
+    return;
+  }
+
+  if (data.startsWith("editimgs:")) {
+    const id = parseInt(data.split(":")[1]);
+    const items = await getItems(env);
+    const item = items.find((it) => it.id === id);
+    if (!item) {
+      await editMessage(chatId, messageId, "محصول پیدا نشد.", env, [[{ text: "« بازگشت به لیست", callback_data: "editmenu:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
+      return;
+    }
+    const count = getItemImages(item).length;
+    await editMessage(chatId, messageId, "محصول #" + id + " — در حال حاضر " + count + " عکس داره.\n\nچیکار کنیم؟", env, editImagesKeyboard(id));
+    return;
+  }
+
+  if (data.startsWith("addimg:")) {
+    const id = parseInt(data.split(":")[1]);
+    await env.SHOP_DB.put("state:" + chatId, "addimg:" + id);
+    await editMessage(chatId, messageId, "عکس(های) جدید رو بفرست. هر چند تا خواستی، یکی‌یکی. وقتی تموم شد دکمه پایین رو بزن.", env, [[{ text: "✅ تمام، بازگشت", callback_data: "edit:" + id }]]);
+    return;
+  }
+
+  if (data.startsWith("delimg:")) {
+    const id = parseInt(data.split(":")[1]);
+    const items = await getItems(env);
+    const item = items.find((it) => it.id === id);
+    if (!item) {
+      await editMessage(chatId, messageId, "محصول پیدا نشد.", env, [[{ text: "« بازگشت به لیست", callback_data: "editmenu:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
+      return;
+    }
+    const images = getItemImages(item);
+    if (images.length > 1) {
+      images.pop();
+      item.images = images;
+      item.image = images[0];
+      await saveItems(items, env);
+    }
+    await editMessage(chatId, messageId, "الان " + images.length + " عکس داره.\n\nچیکار کنیم؟", env, editImagesKeyboard(id));
+    return;
+  }
+
   if (data.startsWith("newcat:")) {
     const val = data.slice("newcat:".length);
     const draft = await saveDraft(chatId, { category: val }, env);
@@ -909,7 +1765,47 @@ async function handleCallbackQuery(cq, env) {
   }
 
   if (data === "stats") {
-    await editMessage(chatId, messageId, await buildStatsText(env), env, [[{ text: "« بازگشت", callback_data: "menu" }]]);
+    await editMessage(chatId, messageId, await buildStatsText(env), env, [
+      [{ text: "❤️ پرطرفدارترین‌ها", callback_data: "favstats" }],
+      [{ text: "« بازگشت", callback_data: "menu" }],
+    ]);
+    return;
+  }
+
+  if (data === "favstats") {
+    await editMessage(chatId, messageId, await buildFavStatsText(env), env, [[{ text: "« بازگشت", callback_data: "stats" }]]);
+    return;
+  }
+
+  if (data === "discounts") {
+    await sendDiscountList(chatId, messageId, env);
+    return;
+  }
+
+  if (data === "newcode") {
+    await env.SHOP_DB.put("state:" + chatId, "disc_code");
+    await editMessage(chatId, messageId, "کد تخفیف رو بفرست (فقط حروف/عدد انگلیسی، بدون فاصله؛ مثلاً WELCOME10):", env, [[{ text: "انصراف", callback_data: "menu" }]]);
+    return;
+  }
+
+  if (data.startsWith("disctype:")) {
+    const type = data.split(":")[1];
+    await saveDiscDraft(chatId, { type }, env);
+    await env.SHOP_DB.put("state:" + chatId, "disc_value");
+    await editMessage(
+      chatId,
+      messageId,
+      type === "percent" ? "چند درصد تخفیف؟ (عدد بین ۱ تا ۱۰۰):" : "چقدر تومان تخفیف؟ (عدد، مثلاً 50000):",
+      env,
+      [[{ text: "انصراف", callback_data: "menu" }]]
+    );
+    return;
+  }
+
+  if (data.startsWith("delcode:")) {
+    const code = data.slice("delcode:".length);
+    await deleteDiscount(code, env);
+    await sendDiscountList(chatId, messageId, env);
     return;
   }
 
@@ -967,18 +1863,47 @@ async function handleCallbackQuery(cq, env) {
 // ============================================================
 const DASHBOARD_TEXT = "پنل مدیریت گالری طلا 🏆\nیکی از گزینه‌ها رو انتخاب کن:";
 
-function dashboardKeyboard() {
-  return [
-    [{ text: "📋 لیست محصولات", callback_data: "list:0" }, { text: "✏️ ویرایش محصول", callback_data: "editmenu:0" }],
-    [{ text: "🗑 حذف محصول", callback_data: "delmenu:0" }, { text: "📊 آمار فروشگاه", callback_data: "stats" }],
-    [{ text: "⚙️ تنظیمات اجرت", callback_data: "settings" }, { text: "🎫 تیکت‌های باز", callback_data: "tickets:0" }],
-    [{ text: "➕ افزودن محصول جدید", callback_data: "newitem" }, { text: "💾 بک‌آپ فوری", callback_data: "dobackup" }],
-    [{ text: "📖 روش سریع (عکس+کپشن)", callback_data: "addhelp" }],
-  ];
+function dashboardKeyboard(role) {
+  const rows = [];
+
+  if (hasPerm(role, "products")) {
+    rows.push([{ text: "📋 لیست محصولات", callback_data: "list:0" }, { text: "✏️ ویرایش محصول", callback_data: "editmenu:0" }]);
+  } else {
+    rows.push([{ text: "📋 لیست محصولات", callback_data: "list:0" }]);
+  }
+
+  const row2 = [];
+  if (hasPerm(role, "delete_product")) row2.push({ text: "🗑 حذف محصول", callback_data: "delmenu:0" });
+  if (hasPerm(role, "stats")) row2.push({ text: "📊 آمار فروشگاه", callback_data: "stats" });
+  if (row2.length) rows.push(row2);
+
+  const row3 = [];
+  if (hasPerm(role, "settings")) row3.push({ text: "⚙️ تنظیمات اجرت", callback_data: "settings" });
+  row3.push({ text: "🎫 تیکت‌های باز", callback_data: "tickets:0" });
+  rows.push(row3);
+
+  if (hasPerm(role, "discounts")) {
+    rows.push([{ text: "🏷 کدهای تخفیف", callback_data: "discounts" }]);
+  }
+
+  const row5 = [];
+  if (hasPerm(role, "products")) row5.push({ text: "➕ افزودن محصول جدید", callback_data: "newitem" });
+  if (hasPerm(role, "backup")) row5.push({ text: "💾 بک‌آپ فوری", callback_data: "dobackup" });
+  if (row5.length) rows.push(row5);
+
+  if (hasPerm(role, "products")) {
+    rows.push([{ text: "📖 روش سریع (عکس+کپشن)", callback_data: "addhelp" }]);
+  }
+
+  if (hasPerm(role, "manage_admins")) {
+    rows.push([{ text: "👥 مدیریت همکاران", callback_data: "admins" }]);
+  }
+
+  return rows;
 }
 
-function sendDashboard(chatId, env) {
-  return sendMessage(chatId, DASHBOARD_TEXT, env, dashboardKeyboard());
+function sendDashboard(chatId, env, role) {
+  return sendMessage(chatId, DASHBOARD_TEXT, env, dashboardKeyboard(role));
 }
 
 const HELP_TEXT =
@@ -1024,7 +1949,7 @@ async function handleNewItem(msg, env) {
   const settings = await getSettings(env);
   const nextId = await getNextId(env);
 
-  const karatVal = parseInt(fields.karat);
+  const karatVal = parseInt(normalizeDigits(fields.karat));
   const defaultFee = karatVal === 24 ? settings.fee24 : settings.fee18;
   const featuredVal = fields.featured ? /^(بله|yes|true|1)$/i.test(fields.featured.trim()) : false;
 
@@ -1034,12 +1959,13 @@ async function handleNewItem(msg, env) {
     category: fields.category,
     model: fields.model || null,
     karat: karatVal,
-    weight: parseFloat(fields.weight),
-    stock: fields.stock ? (parseInt(fields.stock, 10) || 0) : 0,
-    makingFee: fields.fee ? parseFloat(fields.fee) : defaultFee,
+    weight: parseFloat(normalizeDigits(fields.weight)),
+    stock: fields.stock ? (parseInt(normalizeDigits(fields.stock), 10) || 0) : 0,
+    makingFee: fields.fee ? parseFloat(normalizeDigits(fields.fee)) : defaultFee,
     badge: fields.badge || null,
     featured: featuredVal,
     rating: 4.7,
+    images: [imageDataUrl],
     image: imageDataUrl,
     createdAt: Date.now(),
   };
@@ -1062,6 +1988,12 @@ function parseCaption(caption) {
     if (mapped) fields[mapped] = val;
   });
   return fields;
+}
+
+function getItemImages(item) {
+  if (Array.isArray(item.images) && item.images.length) return item.images.slice();
+  if (item.image) return [item.image];
+  return [];
 }
 
 async function getNextId(env) {
@@ -1115,18 +2047,30 @@ function formatItemDetail(it) {
     "موجودی: " + stockTxt + "\n" +
     "اجرت: " + it.makingFee + "٪\n" +
     "برچسب: " + (it.badge || "—") + "\n" +
-    "نمایش در صفحه اصلی: " + (it.featured ? "بله ✅" : "خیر")
+    "نمایش در صفحه اصلی: " + (it.featured ? "بله ✅" : "خیر") + "\n" +
+    "عکس‌ها: " + getItemImages(it).length + " عکس"
   );
 }
 
-function editFieldsKeyboard(id) {
+function editFieldsKeyboard(item) {
+  const id = item.id;
+  const imgCount = getItemImages(item).length;
   return [
     [{ text: "نام", callback_data: "editf:" + id + ":name" }, { text: "دسته", callback_data: "editf:" + id + ":category" }],
     [{ text: "مدل", callback_data: "editf:" + id + ":model" }, { text: "عیار", callback_data: "editf:" + id + ":karat" }],
     [{ text: "وزن", callback_data: "editf:" + id + ":weight" }, { text: "موجودی", callback_data: "editf:" + id + ":stock" }],
     [{ text: "اجرت", callback_data: "editf:" + id + ":fee" }, { text: "برچسب", callback_data: "editf:" + id + ":badge" }],
     [{ text: "نمایش در صفحه اصلی", callback_data: "editf:" + id + ":featured" }],
+    [{ text: "🖼 عکس‌ها (" + imgCount + ")", callback_data: "editimgs:" + id }],
     [{ text: "« بازگشت به لیست", callback_data: "editmenu:0" }, { text: "🏠 منو", callback_data: "menu" }],
+  ];
+}
+
+function editImagesKeyboard(id) {
+  return [
+    [{ text: "➕ افزودن عکس", callback_data: "addimg:" + id }],
+    [{ text: "🗑 حذف آخرین عکس", callback_data: "delimg:" + id }],
+    [{ text: "« بازگشت", callback_data: "edit:" + id }],
   ];
 }
 
@@ -1168,7 +2112,7 @@ async function showEditFieldMenu(chatId, messageId, env, id) {
     await editMessage(chatId, messageId, "محصول پیدا نشد.", env, [[{ text: "« بازگشت به لیست", callback_data: "editmenu:0" }, { text: "🏠 منو", callback_data: "menu" }]]);
     return;
   }
-  await editMessage(chatId, messageId, formatItemDetail(item) + "\n\nکدوم مورد رو ویرایش کنم؟", env, editFieldsKeyboard(id));
+  await editMessage(chatId, messageId, formatItemDetail(item) + "\n\nکدوم مورد رو ویرایش کنم؟", env, editFieldsKeyboard(item));
 }
 
 async function updateItemField(env, id, field, value) {
@@ -1189,13 +2133,13 @@ async function handleEditValueInput(state, msg, chatId, env) {
 
   let value;
   if (field === "weight" || field === "fee") {
-    value = parseFloat(raw);
+    value = parseFloat(normalizeDigits(raw));
     if (isNaN(value)) {
       await sendMessage(chatId, "عدد نامعتبره. دوباره امتحان کن:", env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
       return true;
     }
   } else if (field === "stock") {
-    value = parseInt(raw, 10);
+    value = parseInt(normalizeDigits(raw), 10);
     if (isNaN(value) || value < 0) {
       await sendMessage(chatId, "عدد نامعتبره. تعداد موجودی رو به‌صورت عدد صحیح بفرست:", env, [[{ text: "انصراف", callback_data: "edit:" + id }]]);
       return true;
@@ -1214,7 +2158,7 @@ async function handleEditValueInput(state, msg, chatId, env) {
     await sendMessage(chatId, "محصول پیدا نشد.", env, [[{ text: "🏠 منو", callback_data: "menu" }]]);
     return true;
   }
-  await sendMessage(chatId, "به‌روزرسانی شد ✅\n\n" + formatItemDetail(item), env, editFieldsKeyboard(id));
+  await sendMessage(chatId, "به‌روزرسانی شد ✅\n\n" + formatItemDetail(item), env, editFieldsKeyboard(item));
   return true;
 }
 
@@ -1361,7 +2305,7 @@ async function closeTicket(id, env) {
 async function notifyAdminNewTicketMessage(ticket, env) {
   const lastMsg = ticket.messages[ticket.messages.length - 1];
   const text = "🎫 تیکت #" + ticket.id + " از " + (ticket.name || "کاربر سایت") + "\n\n" + lastMsg.text;
-  await sendMessage(env.ADMIN_ID, text, env, [[{ text: "پاسخ", callback_data: "reply:" + ticket.id }, { text: "بستن تیکت", callback_data: "closetick:" + ticket.id }]]);
+  await notifyAdmins(env, "orders", text, [[{ text: "پاسخ", callback_data: "reply:" + ticket.id }, { text: "بستن تیکت", callback_data: "closetick:" + ticket.id }]]);
 }
 
 async function handleCreateTicket(request, env) {
