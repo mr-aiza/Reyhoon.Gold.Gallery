@@ -221,7 +221,6 @@
   const toToman = n => Math.round(n).toLocaleString("fa-IR");
   let priceReady = pricePoints.length > 0; // داده‌ی واقعیِ ذخیره‌شده رو داریم، پس بلافاصله نشون بده
   const priceReadyCallbacks = [];
-  let previousLivePrice = pricePoints.length ? pricePerGram : null;
   const priceText = n => priceReady ? toToman(n) : "...";
   const price24kVal = () => usingLiveData && live24k ? live24k : pricePerGram*1.33;
   const priceEmamiVal = () => usingLiveData && liveEmami ? liveEmami : pricePerGram*8.13;
@@ -243,8 +242,6 @@
       if(item18k && item18k.price){
         const newPrice = Number(item18k.price);
         if(!isNaN(newPrice) && newPrice > 0){
-          const delta = previousLivePrice !== null ? newPrice - previousLivePrice : null;
-          previousLivePrice = newPrice;
           pricePerGram = newPrice;
           live24k = item24k ? Number(item24k.price) : null;
           liveEmami = itemEmami ? Number(itemEmami.price) : null;
@@ -253,7 +250,6 @@
           priceReady = true;
           updateLiveIndicator();
           refreshAllUI();
-          updatePriceChangeBadge(delta);
           priceReadyCallbacks.splice(0).forEach(cb => cb());
           return;
         }
@@ -276,18 +272,23 @@
     label.textContent = usingLiveData ? "قیمت زنده" : "در حال دریافت قیمت...";
   }
 
-  function updatePriceChangeBadge(delta){
+  // درصد تغییر رو دقیقاً بر اساس همون روندی که روی نمودار (اسپارک‌لاین) رسم می‌شه حساب می‌کنه:
+  // شروعِ بازه‌ی نمایش‌داده‌شده روی نمودار در برابر قیمت فعلی. صعودی=سبز، نزولی=قرمز.
+  function updatePriceChangeBadge(){
     const changeEl = document.getElementById("priceChange");
     const changeVal = document.getElementById("changeVal");
     if(!changeEl || !changeVal) return;
-    if(delta === null){
+    const windowStart = (history && history.length) ? history[0] : null;
+    if(!priceReady || !windowStart || windowStart <= 0){
       changeEl.style.display = "none";
       return;
     }
-    const positive = delta >= 0;
+    const pct = ((pricePerGram - windowStart) / windowStart) * 100;
+    const positive = pct >= 0;
     changeEl.style.display = "";
     changeEl.className = "price-change num " + (positive ? "up" : "down");
-    changeVal.textContent = (positive ? "+" : "") + toToman(delta);
+    const pctText = Math.abs(pct).toLocaleString("fa-IR", { minimumFractionDigits:1, maximumFractionDigits:1 });
+    changeVal.textContent = (positive ? "+" : "−") + pctText + "٪";
   }
 
   function renderMainPrices(){
@@ -303,6 +304,7 @@
     renderMainPrices();
     renderSparkline();
     renderRecentRange();
+    updatePriceChangeBadge();
     renderTicker();
     renderProducts();
     updateCalculator();
@@ -1231,7 +1233,7 @@ ${discountText}
   // ---------- Init ----------
   renderSkeleton();
   loadCart();
-  updatePriceChangeBadge(null);
+  updatePriceChangeBadge();
   renderMainPrices();
   renderTicker();
   renderSparkline();
