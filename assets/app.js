@@ -30,7 +30,6 @@
     const mobileNavHTML = links.map(l => `<a href="${l.href}" class="mobile-link${l.active ? ' active' : ''}">${l.label}</a>`).join("");
 
     root.innerHTML = `
-      <div class="ticker-wrap"><div class="ticker-track" id="tickerTrack"></div></div>
       <header id="siteHeader">
         <div class="container">
           <div class="brand" style="display:flex;align-items:center;gap:12px;">
@@ -182,23 +181,6 @@
     history = sparkWindowFromPoints(pricePoints);
   }
 
-  // کمترین و بیشترین قیمت واقعی توی همین بافر گردشی (برای نمایش بازه‌ی نوسان اخیر)
-  function recentPriceRange(){
-    if(!pricePoints.length) return null;
-    let min = pricePoints[0].p, max = pricePoints[0].p;
-    for(const pt of pricePoints){ if(pt.p < min) min = pt.p; if(pt.p > max) max = pt.p; }
-    return { min, max };
-  }
-
-  function renderRecentRange(){
-    const el = document.getElementById("dayRange");
-    if(!el) return;
-    const range = recentPriceRange();
-    if(!range || !priceReady){ el.style.display = "none"; return; }
-    el.style.display = "";
-    el.innerHTML = `بازه نوسان اخیر: <span class="num">${toToman(range.min)}</span> تا <span class="num">${toToman(range.max)}</span> تومان`;
-  }
-
   let pricePerGram = 38450000;
   let history = [];
   if(pricePoints.length){
@@ -218,7 +200,7 @@
   let undoTimer = null;
   let lastRemoved = null; // { line, index }
 
-  const toToman = n => Math.round(n).toLocaleString("fa-IR");
+  const toToman = n => Math.round(n).toLocaleString("en-US");
   let priceReady = pricePoints.length > 0; // داده‌ی واقعیِ ذخیره‌شده رو داریم، پس بلافاصله نشون بده
   const priceReadyCallbacks = [];
   const priceText = n => priceReady ? toToman(n) : "...";
@@ -298,14 +280,16 @@
     if(p24) p24.textContent = priceText(price24kVal());
     const pc = document.getElementById("priceCoin");
     if(pc) pc.textContent = priceText(priceEmamiVal());
+    const phc = document.getElementById("priceHalfCoin");
+    if(phc) phc.textContent = priceText(pricePerGram*4.06);
+    const pqc = document.getElementById("priceQuarterCoin");
+    if(pqc) pqc.textContent = priceText(pricePerGram*2.03);
   }
 
   function refreshAllUI(){
     renderMainPrices();
     renderSparkline();
-    renderRecentRange();
     updatePriceChangeBadge();
-    renderTicker();
     renderProducts();
     updateCalculator();
     renderCart();
@@ -343,20 +327,6 @@
   }
   function productPrice(p){ return karatBaseRate(p.karat) * p.weight * (1 + p.makingFee/100); }
 
-  // ---------- Ticker ----------
-  function renderTicker(){
-    const track = document.getElementById("tickerTrack");
-    if(!track) return;
-    const items = [
-      { label:"طلای ۱۸ عیار (هر گرم)", val:pricePerGram },
-      { label:"طلای ۲۴ عیار (هر گرم)", val:price24kVal() },
-      { label:"سکه امامی", val:priceEmamiVal() },
-      { label:"نیم سکه", val:pricePerGram*4.06 },
-      { label:"ربع سکه", val:pricePerGram*2.03 },
-    ];
-    let groupHTML = items.map(it => `<span class="ticker-item"><span>${it.label}</span><span class="val num">${priceText(it.val)}</span><span class="unit">تومان</span></span>`).join("");
-    track.innerHTML = `<div class="ticker-group">${groupHTML}</div><div class="ticker-group">${groupHTML}</div>`;
-  }
 
   // ---------- Sparkline ----------
   // به‌جای پرش یهویی به شکل جدید، خط از حالت قبلی به حالت جدید نرم animate می‌شه؛
@@ -1235,9 +1205,7 @@ ${discountText}
   loadCart();
   updatePriceChangeBadge();
   renderMainPrices();
-  renderTicker();
   renderSparkline();
-  renderRecentRange();
   renderProducts();
   updateCalculator();
   renderCart();
