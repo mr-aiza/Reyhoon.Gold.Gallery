@@ -11,7 +11,7 @@ const CORS_HEADERS = {
 
 const PAGE_SIZE = 5;
 
-const DEFAULT_SETTINGS = { fee18: 20, fee24: 4 };
+const DEFAULT_SETTINGS = { fee18: 20, fee24: 4, referralBuyerDiscountPercent: 5, referralBonusPoints: 50 };
 
 // آدرس سایت فروشگاه (برای ساخت لینک فاکتور که تو تلگرام فرستاده می‌شه)
 // نکته مهم: این مقدار قبلاً هاردکد و روی یه دامنه‌ی اشتباه/قدیمی بود، برای همین لینک فاکتور
@@ -187,6 +187,17 @@ export default {
     if (url.pathname === "/api/auth/logout" && request.method === "POST") {
       return handleAuthLogout(request, env);
     }
+    if (url.pathname === "/api/auth/update-profile" && request.method === "POST") {
+      return handleUpdateProfile(request, env);
+    }
+    if (url.pathname === "/api/auth/change-password" && request.method === "POST") {
+      return handleChangePassword(request, env);
+    }
+
+    // ---- کیف پول، امتیاز وفاداری و کد معرفی کاربر لاگین‌کرده ----
+    if (url.pathname === "/api/wallet/mine" && request.method === "GET") {
+      return handleWalletMine(request, env);
+    }
 
     // ---- پیگیری سفارش‌های کاربر لاگین‌کرده ----
     if (url.pathname === "/api/orders/mine" && request.method === "GET") {
@@ -335,7 +346,14 @@ async function saveUserShippingProfile(phone, profile, env) {
 }
 
 function publicUser(user) {
-  return { phone: user.phone, name: user.name || null, shipping: user.shipping || null };
+  return {
+    phone: user.phone,
+    name: user.name || null,
+    shipping: user.shipping || null,
+    points: user.points || 0,
+    walletBalance: user.walletBalance || 0,
+    referralCode: user.referralCode || null,
+  };
 }
 
 async function handleAuthRegister(request, env) {
@@ -363,8 +381,9 @@ async function handleAuthRegister(request, env) {
 
   const salt = generateRandomToken();
   const passwordHash = await hashPassword(password, salt);
-  const user = { phone, name: name || null, passwordHash, salt, createdAt: Date.now() };
+  const user = { phone, name: name || null, passwordHash, salt, points: 0, walletBalance: 0, createdAt: Date.now() };
   await env.SHOP_DB.put("user:" + phone, JSON.stringify(user));
+  try { await ensureReferralCode(user, env); } catch (err) { /* ساخت کد رفرال نباید ثبت‌نام رو خراب کنه */ }
 
   const token = await createSession(phone, env);
   return jsonResponse({ token, ...publicUser(user) });
@@ -406,6 +425,104 @@ async function handleAuthLogout(request, env) {
   return jsonResponse({ ok: true });
 }
 
+// کاربر لاگین‌کرده نام و مشخصات ارسالی خودش رو از پروفایل (نه فقط موقع چک‌اوت) ویرایش می‌کنه
+async function handleUpdateProfile(request, env) {
+  const account = await getUserFromRequest(request, env);
+  if (!account) return jsonResponse({ error: "وارد نشدی." }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "بدنه درخواست نامعتبره." }, 400);
+  }
+
+  const name = String(body.name || "").trim();
+  const email = String(body.email || "").trim();
+  const postalCode = String(body.postalCode || "").trim();
+  const address = String(body.address || "").trim();
+
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return jsonResponse({ error: "ایمیل معتبر نیست." }, 400);
+  }
+  if (postalCode && !/^\d{10}$/.test(postalCode)) {
+    return jsonResponse({ error: "کد پستی باید ۱۰ رقم باشه." }, 400);
+  }
+
+  const user = await getUserRaw(account.phone, env);
+  if (!user) return jsonResponse({ error: "کاربر پیدا نشد." }, 404);
+
+  user.name = name || user.name || null;
+  user.shipping = {
+    name: name || user.shipping?.name || "",
+    email: email || user.shipping?.email || "",
+    postalCode: postalCode || user.shipping?.postalCode || "",
+    address: address || user.shipping?.address || "",
+    updatedAt: Date.now(),
+  };
+  await saveUserRaw(user, env);
+
+  return jsonResponse(publicUser(user));
+}
+
+// تغییر رمز عبور از داخل پروفایل کاربر (نیازمند وارد کردن رمز فعلی برای امنیت بیشتر)
+async function handleChangePassword(request, env) {
+  const account = await getUserFromRequest(request, env);
+  if (!account) return jsonResponse({ error: "وارد نشدی." }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: "بدنه درخواست نامعتبره." }, 400);
+  }
+
+  const currentPassword = String(body.currentPassword || "");
+  const newPassword = String(body.newPassword || "");
+  if (newPassword.length < 4) {
+    return jsonResponse({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشه." }, 400);
+  }
+
+  const user = await getUserRaw(account.phone, env);
+  if (!user) return jsonResponse({ error: "کاربر پیدا نشد." }, 404);
+
+  const currentHash = await hashPassword(currentPassword, user.salt);
+  if (currentHash !== user.passwordHash) {
+    return jsonResponse({ error: "رمز عبور فعلی اشتباهه." }, 401);
+  }
+
+  const salt = generateRandomToken();
+  user.passwordHash = await hashPassword(newPassword, salt);
+  user.salt = salt;
+  await saveUserRaw(user, env);
+
+  return jsonResponse({ ok: true });
+}
+
+// خلاصه‌ی کیف پول/امتیاز/کد معرفی + گردش حساب کاربر لاگین‌کرده، برای صفحه پروفایل
+async function handleWalletMine(request, env) {
+  const account = await getUserFromRequest(request, env);
+  if (!account) return jsonResponse({ error: "وارد نشدی." }, 401);
+
+  const user = await getUserRaw(account.phone, env);
+  if (!user) return jsonResponse({ error: "کاربر پیدا نشد." }, 404);
+
+  let referralCode = user.referralCode;
+  try { referralCode = await ensureReferralCode(user, env); } catch (e) { /* بی‌اثر */ }
+
+  const ledger = await getLedger(account.phone, env);
+  const refSettings = await getSettings(env);
+
+  return jsonResponse({
+    points: user.points || 0,
+    walletBalance: user.walletBalance || 0,
+    referralCode,
+    referralBuyerDiscountPercent: refSettings.referralBuyerDiscountPercent,
+    referralBonusPoints: refSettings.referralBonusPoints,
+    ledger,
+  });
+}
+
 async function handleNewOrder(request, env) {
   let body;
   try {
@@ -425,24 +542,54 @@ async function handleNewOrder(request, env) {
 
   let total = subtotal;
   let discountInfo = null;
+  let referralOwnerPhone = null;
+
+  // اگه کاربر لاگین باشه، سفارش به حسابش وصل می‌شه (برای پیگیری بعدی) — قبل از محاسبه‌ی تخفیف لازمه
+  const account = await getUserFromRequest(request, env);
 
   if (discountCodeRaw) {
     const discount = await getDiscount(discountCodeRaw, env);
     if (discount && discount.active) {
-      const discountAmount = computeDiscountAmount(discount, subtotal);
-      total = Math.max(0, subtotal - discountAmount);
-      discountInfo = { code: discount.code, type: discount.type, value: discount.value, discountAmount };
-      discount.usageCount = (discount.usageCount || 0) + 1;
-      await saveDiscount(discount, env);
+      if (discount.kind === "points") {
+        // کد امتیازی: فقط برای کاربر لاگین‌شده با موجودی امتیاز کافی اعمال می‌شه
+        if (account) {
+          const freshUser = await getUserRaw(account.phone, env);
+          const balance = (freshUser && freshUser.points) || 0;
+          if (balance >= (discount.pointsCost || 0)) {
+            const discountAmount = computeDiscountAmount(discount, subtotal);
+            total = Math.max(0, subtotal - discountAmount);
+            discountInfo = { code: discount.code, type: discount.type, value: discount.value, discountAmount, kind: "points", pointsCost: discount.pointsCost };
+            discount.usageCount = (discount.usageCount || 0) + 1;
+            await saveDiscount(discount, env);
+            try { await adjustPoints(account.phone, -(discount.pointsCost || 0), "استفاده از کد امتیازی " + discount.code, env); } catch (err) { /* بی‌اثر */ }
+          }
+        }
+      } else {
+        const discountAmount = computeDiscountAmount(discount, subtotal);
+        total = Math.max(0, subtotal - discountAmount);
+        discountInfo = { code: discount.code, type: discount.type, value: discount.value, discountAmount, kind: discount.kind || "simple" };
+        discount.usageCount = (discount.usageCount || 0) + 1;
+        await saveDiscount(discount, env);
+      }
+    } else if (!discount) {
+      // اگه کد تخفیف معمولی نبود، شاید کدِ معرفیِ (رفرال) یکی از کاربرهای سایت باشه
+      const ownerPhone = await getReferralOwnerPhone(discountCodeRaw, env);
+      if (ownerPhone && (!account || account.phone !== ownerPhone)) {
+        const refSettings = await getSettings(env);
+        const pct = Number(refSettings.referralBuyerDiscountPercent) || 0;
+        if (pct > 0) {
+          const discountAmount = Math.round((subtotal * pct) / 100);
+          total = Math.max(0, subtotal - discountAmount);
+          discountInfo = { code: discountCodeRaw, type: "percent", value: pct, discountAmount, kind: "referral" };
+          referralOwnerPhone = ownerPhone;
+        }
+      }
     }
   }
 
   if (!name || !phone || !email || !postalCode || !address || items.length === 0) {
     return jsonResponse({ ok: false, error: "missing fields" }, 400);
   }
-
-  // اگه کاربر لاگین باشه، سفارش به حسابش وصل می‌شه (برای پیگیری بعدی)
-  const account = await getUserFromRequest(request, env);
 
   const ticketNumber = await getNextTicket(env);
   const invoiceToken = crypto.randomUUID().replace(/-/g, "");
@@ -467,6 +614,16 @@ async function handleNewOrder(request, env) {
   };
 
   await env.SHOP_DB.put("order:" + ticketNumber, JSON.stringify(order));
+
+  if (referralOwnerPhone) {
+    try {
+      const refSettings = await getSettings(env);
+      const bonus = Number(refSettings.referralBonusPoints) || 0;
+      if (bonus > 0) {
+        await adjustPoints(referralOwnerPhone, bonus, "پاداش معرفی مشتری جدید (سفارش #" + ticketNumber + ")", env);
+      }
+    } catch (err) { /* پاداش رفرال نباید ثبت سفارش رو خراب کنه */ }
+  }
 
   if (account) {
     try {
@@ -624,12 +781,101 @@ async function deleteDiscount(code, env) {
 }
 
 function computeDiscountAmount(discount, subtotal) {
+  if (discount.kind === "tiered" && Array.isArray(discount.tiers) && discount.tiers.length) {
+    const eligible = discount.tiers
+      .filter((t) => subtotal >= (Number(t.minTotal) || 0))
+      .sort((a, b) => (Number(b.minTotal) || 0) - (Number(a.minTotal) || 0));
+    const tier = eligible[0];
+    if (!tier) return 0;
+    return tier.type === "percent"
+      ? Math.round((subtotal * Number(tier.value)) / 100)
+      : Math.min(Number(tier.value), subtotal);
+  }
   if (discount.type === "percent") return Math.round((subtotal * discount.value) / 100);
   return Math.min(discount.value, subtotal);
 }
 
 function discountLabel(discount) {
+  if (discount.kind === "tiered") return "کد پلکانی (بر اساس مبلغ سفارش)";
+  if (discount.kind === "points") return "کد امتیازی (" + (discount.pointsCost || 0) + " امتیاز)";
   return discount.type === "percent" ? discount.value + "% تخفیف" : toToman(discount.value) + " تومان تخفیف";
+}
+
+// ============================================================
+//  گردش حساب (کیف پول)، امتیاز وفاداری و کد معرفی (رفرال)
+// ============================================================
+const LEDGER_CAP = 200;
+
+async function getLedger(phone, env) {
+  const raw = await env.SHOP_DB.get("ledger:" + phone);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function addLedgerEntry(phone, entry, env) {
+  const list = await getLedger(phone, env);
+  list.unshift({
+    id: crypto.randomUUID().slice(0, 8),
+    ts: Date.now(),
+    type: entry.type,
+    amount: Number(entry.amount) || 0,
+    unit: entry.unit || "toman",
+    note: entry.note || "",
+    ref: entry.ref || null,
+  });
+  if (list.length > LEDGER_CAP) list.length = LEDGER_CAP;
+  await env.SHOP_DB.put("ledger:" + phone, JSON.stringify(list));
+}
+
+async function getUserRaw(phone, env) {
+  const raw = await env.SHOP_DB.get("user:" + phone);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function saveUserRaw(user, env) {
+  await env.SHOP_DB.put("user:" + user.phone, JSON.stringify(user));
+}
+
+async function adjustWallet(phone, amount, note, env) {
+  const user = await getUserRaw(phone, env);
+  if (!user) throw new Error("کاربر پیدا نشد");
+  user.walletBalance = (user.walletBalance || 0) + Number(amount);
+  await saveUserRaw(user, env);
+  await addLedgerEntry(phone, { type: amount >= 0 ? "credit" : "debit", amount: Math.abs(amount), unit: "toman", note }, env);
+  return user.walletBalance;
+}
+
+async function adjustPoints(phone, points, note, env) {
+  const user = await getUserRaw(phone, env);
+  if (!user) throw new Error("کاربر پیدا نشد");
+  user.points = (user.points || 0) + Number(points);
+  await saveUserRaw(user, env);
+  await addLedgerEntry(phone, { type: points >= 0 ? "credit" : "debit", amount: Math.abs(points), unit: "point", note }, env);
+  return user.points;
+}
+
+function generateReferralCode(phone) {
+  const tail = String(phone).slice(-4);
+  const rand = Math.random().toString(36).slice(2, 5).toUpperCase();
+  return "RG-" + tail + rand;
+}
+
+async function ensureReferralCode(user, env) {
+  if (user.referralCode) return user.referralCode;
+  let code = null;
+  for (let i = 0; i < 5; i++) {
+    const candidate = generateReferralCode(user.phone);
+    const exists = await env.SHOP_DB.get("referral_code:" + candidate);
+    if (!exists) { code = candidate; break; }
+  }
+  if (!code) code = generateReferralCode(user.phone) + Date.now().toString().slice(-3);
+  user.referralCode = code;
+  await saveUserRaw(user, env);
+  await env.SHOP_DB.put("referral_code:" + code, user.phone);
+  return code;
+}
+
+async function getReferralOwnerPhone(code, env) {
+  return await env.SHOP_DB.get("referral_code:" + String(code).toUpperCase());
 }
 
 async function handleDiscountCheck(request, env) {
@@ -644,19 +890,50 @@ async function handleDiscountCheck(request, env) {
   if (!code) return jsonResponse({ valid: false, error: "کد رو وارد کن." });
 
   const discount = await getDiscount(code, env);
-  if (!discount || !discount.active) {
-    return jsonResponse({ valid: false, error: "کد تخفیف معتبر نیست." });
+  if (discount && discount.active) {
+    if (discount.kind === "points") {
+      const account = await getUserFromRequest(request, env);
+      if (!account) return jsonResponse({ valid: false, error: "برای استفاده از کد امتیازی باید وارد حساب بشی." });
+      const freshUser = await getUserRaw(account.phone, env);
+      const balance = (freshUser && freshUser.points) || 0;
+      if (balance < (discount.pointsCost || 0)) {
+        return jsonResponse({ valid: false, error: "امتیاز کافی نداری (موجودی: " + balance + "، لازم: " + discount.pointsCost + ")." });
+      }
+    }
+    const discountAmount = computeDiscountAmount(discount, subtotal);
+    return jsonResponse({
+      valid: true,
+      code: discount.code,
+      type: discount.type,
+      value: discount.value,
+      discountAmount,
+      kind: discount.kind || "simple",
+      label: discountLabel(discount),
+    });
   }
 
-  const discountAmount = computeDiscountAmount(discount, subtotal);
-  return jsonResponse({
-    valid: true,
-    code: discount.code,
-    type: discount.type,
-    value: discount.value,
-    discountAmount,
-    label: discountLabel(discount),
-  });
+  // شاید کد وارد شده یک کد معرفی (رفرال) باشه
+  const ownerPhone = await getReferralOwnerPhone(code, env);
+  if (ownerPhone) {
+    const account = await getUserFromRequest(request, env);
+    if (account && account.phone === ownerPhone) {
+      return jsonResponse({ valid: false, error: "نمی‌تونی از کد معرفی خودت استفاده کنی." });
+    }
+    const refSettings = await getSettings(env);
+    const pct = Number(refSettings.referralBuyerDiscountPercent) || 0;
+    const discountAmount = Math.round((subtotal * pct) / 100);
+    return jsonResponse({
+      valid: true,
+      code,
+      type: "percent",
+      value: pct,
+      discountAmount,
+      kind: "referral",
+      label: "کد معرفی (" + pct + "% تخفیف)",
+    });
+  }
+
+  return jsonResponse({ valid: false, error: "کد تخفیف معتبر نیست." });
 }
 
 // ------------------------------------------------------------
@@ -898,8 +1175,12 @@ async function buildUserDetailView(phone, env) {
     "👤 " + (user.name || "بدون نام") + "\n" +
     "شماره تماس: " + user.phone + "\n" +
     "تاریخ عضویت: " + new Date(user.createdAt).toLocaleDateString("fa-IR") + "\n\n" +
+    "💰 موجودی کیف پول: " + toToman(user.walletBalance || 0) + " تومان\n" +
+    "🎯 امتیاز باشگاه مشتریان: " + (user.points || 0) +
+    (user.referralCode ? "\n🔗 کد معرفی: " + user.referralCode : "") + "\n\n" +
     "🧾 تعداد سفارش‌ها: " + ticketNumbers.length +
     (ticketNumbers.length ? "\nشماره تیکت‌ها: " + ticketNumbers.slice(0, 10).join("، ") : "") + "\n\n" +
+
     "❤️ علاقه‌مندی‌ها (" + favNames.length + "):\n" + (favNames.length ? favNames.join("\n") : "—") +
     shippingBlock;
 
